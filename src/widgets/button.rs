@@ -1,70 +1,68 @@
-use futures::Stream;
-use futures_util::SinkExt;
-use futures_util::stream::StreamExt;
-use tokio::select;
-use crate::element::{Element, ElementInner};
+use std::cell::Cell;
+use crate::element::{Element, Visual};
+use crate::event::Event;
 use crate::handler::Handler;
-use crate::layout::BoxConstraints;
+use crate::layout::{BoxConstraints, Geometry};
+use kurbo::Point;
+use std::rc::{Rc, Weak};
 
 pub struct Button {
-    pub element: Element,   // Element base
-    pub clicked: Handler<()>,   // async handler
+    pub element: Element,     // Element base
+    pub clicked: Handler<()>, // async handler
+    pressed: Cell<bool>,
 }
 
 impl Button {
-    pub fn new() -> Button {
-        let mut button = Button {
-            element: Element::new(),
-            clicked: Handler::new(),
-        };
+    pub fn new() -> Rc<Button> {
+        let mut button = Element::new_derived(|element| {
+            Button {
+                element,
+                clicked: Handler::new(),
+                pressed: Cell::new(false),
+            }
+        });
 
-        let rect = Rectangle::new();        // Rc<Rectangle>, with Rectangle: impl Visual
+        //let rect = Rectangle::new();        // Rc<Rectangle>, with Rectangle: impl Visual
         // add_child: Rc<dyn Visual>
-        button.add_child(&rect);    // add_child provided by impl visual, defers to element
+        //button.add_child(&rect);    // add_child provided by impl visual, defers to element
         button
+    }
+
+    pub async fn clicked(&self) {
+        self.clicked.wait().await
     }
 }
 
 impl Visual for Button {
-    fn base(&self) -> &Element {
+    fn element(&self) -> &Element {
         &self.element
     }
 
-    fn layout(&self, constraints: &BoxConstraints) -> Layout {
-        Layout::default()
+    fn layout(&self, constraints: &BoxConstraints) -> Geometry {
+        Geometry::default()
     }
-}
 
-async fn button_handler(this: &ElementInner<Button>) {
+    fn hit_test(&self, position: Point) -> bool {
+        // check if the position is within the bounds of the button
+        false
+    }
 
-    // Rectangle is a simple Rc<> wrapper and implements the Element trait
-    // It contains no futures. There's
-
-    let rect = Rectangle::new();    // Rc<Rectangle>
-
-    // set style...
-    // woops, can't set parent on rect, no Rc<> available for this
-    this.set_content(&rect);
-
-    let mut pressed = false;
-    loop {
-        // listen for mouse events
-        select! {
-            _ = rect.mouse_down() => {
-                pressed = true;
+    async fn event(&self, event: &Event) {
+        match event {
+            Event::PointerDown(_) => {
+                eprintln!("pointer down") ;
+                self.pressed.set(true)
             }
-            _ = rect.mouse_up() => {
-                if pressed {
-                    pressed = false;
-                    this.clicked.emit(()).await;
+            Event::PointerUp(_) => {
+                if self.pressed.get() {
+                    self.pressed.set(false);
+                    eprintln!("pointer up") ;
+                    self.clicked.emit(()).await;
                 }
             }
+            _ => {}
         }
     }
-}
-
-pub fn button() -> Element<Button> {
-    Element::with_future(button_handler)
 }
 
 #[cfg(test)]

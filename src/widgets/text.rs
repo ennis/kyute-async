@@ -1,2 +1,2 @@
 //! Text elements.
-use crate::element::{Element, VisualDelegate};
+use crate::element::{Element};

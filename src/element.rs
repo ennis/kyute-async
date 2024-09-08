@@ -1,23 +1,23 @@
-use std::{mem, ptr, task};
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::future::{Future, pending};
+use std::future::{pending, Future};
 use std::marker::PhantomPinned;
 use std::ops::Deref;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::{mem, ptr, task};
 
 use bitflags::bitflags;
 use futures_util::future::LocalBoxFuture;
-use futures_util::FutureExt;
 use futures_util::task::ArcWake;
+use futures_util::FutureExt;
 use kurbo::Point;
 use pin_weak::rc::PinWeak;
 use slab::Slab;
 
-use crate::application;
+use crate::{application, PaintCtx};
 use crate::event::Event;
 use crate::handler::Handler;
 use crate::layout::{BoxConstraints, Geometry};
@@ -37,51 +37,130 @@ bitflags! {
     }
 }
 
-// We are allocating for:
-// - the VisualDelegate
-// - the future (BoxFuture)
-// - the ElementInner itself
-// - the Vec of children
-// - the Event handler
+
+pub type AnyVisual = Rc<dyn Visual>;
 
 /// The inner state of an element.
-pub struct ElementInner<T: ?Sized + 'static> {
+pub struct Element {
     _pin: PhantomPinned,
+    weak_this: Weak<dyn Visual>,
     key: Cell<usize>,
-    parent: RefCell<Option<WeakElement>>,
+    parent: RefCell<Option<Weak<dyn Visual>>>,
     transform: Cell<kurbo::Affine>,
     geometry: Cell<Geometry>,
     change_flags: Cell<ChangeFlags>,
-    events: Handler<Event>,
-    children: RefCell<Vec<Element<dyn Any>>>,
-    visual: RefCell<Rc<dyn VisualDelegate>>,
+    children: RefCell<Vec<AnyVisual>>,
     // self-referential
     // would be nice if we didn't have to allocate
     // would be nice if this was a regular task
     // NOTE: we already allocate for the VisualDelegate, we might as well allocate another for the
     // shared state between the task and the element, instead of this weird self-reference thing.
     // It's not like we're allocating on every event.
-    future: RefCell<Option<LocalBoxFuture<'static, ()>>>,
-    state: T,
+    //future: RefCell<Option<LocalBoxFuture<'static, ()>>>,
+    //state: T,
 }
 
-// Move the future out of ElementInner? Use a special element instead?
+impl Element {
+    pub fn new(weak_this: &Weak<dyn Visual>) -> Element {
+        Element {
+            _pin: PhantomPinned,
+            weak_this: weak_this.clone(),
+            key: Cell::new(0),
+            parent: RefCell::new(None),
+            transform: Cell::new(kurbo::Affine::default()),
+            geometry: Cell::new(Geometry::default()),
+            change_flags: Cell::new(ChangeFlags::NONE),
+            children: RefCell::new(Vec::new()),
+        }
+    }
 
-impl<T: 'static + ?Sized> Drop for ElementInner<T> {
-    fn drop(&mut self) {
-        // FIXME: this is problematic because we have a &mut self here,
-        // and at the same time, a &self in the future. If somehow the future has a drop impl
-        // that accesses the element, this breaks everything.
-        //
-        // Actually, miri doesn't complain until we explicitly make a `&mut ref` to a field.
-
-
-        ELEMENT_BY_KEY.with_borrow_mut(|elements| {
-            elements.remove(self.key.get());
-        });
+    pub fn new_derived<'a, T: Visual + 'static>(f: impl FnOnce(Element) -> T) -> Rc<T> {
+        Rc::new_cyclic(move |weak: &Weak<T>| {
+            let weak : Weak<dyn Visual> = weak.clone();
+            let element = Element::new(&weak);
+            let visual = f(element);
+            visual
+        })
     }
 }
 
+impl Drop for Element {
+    fn drop(&mut self) {
+    }
+}
+
+pub trait Visual: EventTarget {
+    fn element(&self) -> &Element;
+    fn layout(&self, constraints: &BoxConstraints) -> Geometry;
+    fn hit_test(&self, point: Point) -> bool;
+    fn paint(&self, ctx: &mut PaintCtx) {}
+
+    // Why async? this is because the visual may transfer control to async event handlers
+    // before returning.
+    async fn event(&self, event: &Event) where Self: Sized;
+}
+
+trait EventTarget {
+    fn event_future<'a>(&'a self, event: &'a Event) -> LocalBoxFuture<'a, ()>;
+}
+
+impl<W> EventTarget for W where W: Visual {
+    fn event_future<'a>(&'a self, event: &'a Event) -> LocalBoxFuture<'a, ()> {
+        self.event(event).boxed_local()
+    }
+}
+
+impl dyn Visual + '_ {
+    /// Returns this visual as a reference-counted pointer.
+    pub fn rc(&self) -> Rc<dyn Visual> {
+        self.element().weak_this.upgrade().unwrap()
+    }
+
+    /// Adds a child visual and sets its parent to this visual.
+    pub fn add_child(&self, child: &dyn Visual) {
+        let this = self.element();
+        child.remove();
+        child.element().parent.replace(Some(this.weak_this.clone()));
+        this.children.borrow_mut().push(child.rc());
+        //this.mark_layout_dirty();
+    }
+
+    /// Removes all child visuals.
+    pub fn clear_children(&self) {
+        self.element().children.borrow_mut().clear();
+        //self.mark_layout_dirty();
+    }
+
+    /// Removes the specified visual from the children of this visual.
+    pub fn remove_child(&self, child: &dyn Visual) {
+        let this = self.element();
+        let index = this.children.borrow().iter().position(|c| ptr::eq(&**c, child));
+
+        if let Some(index) = index {
+            this.children.borrow_mut().remove(index);
+            //self.mark_layout_dirty();
+        }
+    }
+
+    /// Returns the parent of this visual, if it has one.
+    pub fn parent(&self) -> Option<Rc<dyn Visual>> {
+        self.element().parent.borrow().as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Removes this visual from its parent.
+    pub fn remove(&self) {
+        if let Some(parent) = self.parent() {
+            parent.remove_child(self);
+        }
+    }
+
+    pub async fn send_event(&self, event: &Event) {
+        // issue: allocating on every event is not great
+        self.event_future(event).await;
+    }
+}
+
+/*
 /// Async fns that take an element as argument (arguments to `with_future`).
 pub trait ElementFn<'a, T> {
     type Future: Future + 'a;
@@ -97,14 +176,15 @@ where
     fn call(self, source: &'a ElementInner<T>) -> Self::Future {
         self(source)
     }
-}
+}*/
 
-/// A visual element in the UI tree.
+// A visual element in the UI tree.
 // NOTE: it's not a wrapper type because we want unsized coercion to work (and CoerceUnsized is not stable).
 // The ergonomics around unsized coercion is really atrocious currently.
-#[derive(Clone)]
-pub struct Element<T: 'static + ?Sized = dyn Any>(Pin<Rc<ElementInner<T>>>);
+//#[derive(Clone)]
+//pub struct Element<T: 'static + ?Sized = dyn Any>(Pin<Rc<ElementInner<T>>>);
 
+/*
 // Manual unsized coercion
 impl<T: 'static> From<Element<T>> for Element {
     fn from(value: Element<T>) -> Self {
@@ -118,8 +198,9 @@ impl<T: 'static + ?Sized> Deref for Element<T> {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
-}
+}*/
 
+/*
 thread_local! {
     static ELEMENT_BY_KEY: RefCell<Slab<WeakElement>> = RefCell::new(Slab::new());
 }
@@ -132,60 +213,6 @@ pub fn wakeup_element(key: usize) {
         .lock()
         .unwrap();
     queue.push_back(key);
-}
-
-impl<T: 'static + Default> Element<T> {
-    /// Creates a new element with the default size and transform, and no parent.
-    pub fn new() -> Self {
-        // Rc<Pin> is there to make sure we don't call Rc::try_unwrap
-        // or do anything that would move ElementInner.
-        // Otherwise, Rc already guarantees that the pointee won't move in memory.
-        let element = Element(Rc::pin(ElementInner {
-            _pin: Default::default(),
-            parent: Default::default(),
-            key: Default::default(),
-            transform: Default::default(),
-            geometry: Default::default(),
-            change_flags: Default::default(),
-            events: Handler::new(),
-            children: Default::default(),
-            visual: RefCell::new(Rc::new(NullVisual)),
-            future: RefCell::new(None),
-            state: T::default(),
-        }));
-        ELEMENT_BY_KEY.with_borrow_mut(|elements| {
-            let key = elements.insert(WeakElement(PinWeak::downgrade(element.0.clone())));
-            element.key.set(key);
-        });
-        element
-    }
-
-    pub fn with_future<F>(f: F) -> Element<T>
-    where
-        F: for<'a> ElementFn<'a, T> + 'static,
-    {
-        let mut element = Element::new();
-        let ptr = &*element.0 as *const ElementInner<T>;
-
-        let future = async move {
-            // SAFETY:
-            // - the pointee is pinned, so it can't move
-            // - the future is dropped before the pointee so the future won't outlive the element
-            let inner = unsafe { &*ptr };
-            f.call(inner).await;
-            // Element futures should never return; we always drop them as the element is dropped.
-            pending::<()>().await;
-        };
-
-        element.0.future.borrow_mut().replace(future.boxed_local());
-
-        {
-            let element_any: Element = element.clone().into();
-            element_any.poll();
-        }
-
-        element
-    }
 }
 
 
@@ -227,8 +254,9 @@ pub(crate) fn poll_elements() {
             element.poll()
         }
     }
-}
+}*/
 
+/*
 impl Element {
     /// Sets the visual delegate of the element.
     ///
@@ -253,10 +281,6 @@ impl Element {
         // TODO
     }
 
-    /// Returns the parent element, if any.
-    pub fn parent(&self) -> Option<Element<dyn Any>> {
-        self.0.parent.borrow().as_ref().and_then(WeakElement::upgrade)
-    }
 
     /// Returns the last computed geometry of this element.
     pub fn geometry(&self) -> Geometry {
@@ -286,46 +310,9 @@ impl Element {
             parent.mark_layout_dirty();
         }
     }
+}*/
 
-    /// Adds a child element and sets its parent to this element.
-    pub fn add_child(&self, child: Element) {
-        child.remove();
-        child
-            .0
-            .parent
-            .replace(Some(WeakElement(PinWeak::downgrade(self.0.clone()))));
-        self.0.children.borrow_mut().push(child);
-        self.mark_layout_dirty();
-    }
-
-    /// Removes all child elements.
-    pub fn clear_children(&self) {
-        self.0.children.borrow_mut().clear();
-        self.mark_layout_dirty();
-    }
-
-    /// Removes the specified element from the children.
-    pub fn remove_child(&self, child: &Element) {
-        let index = self
-            .0
-            .children
-            .borrow()
-            .iter()
-            .position(|c| ptr::eq(&*c.0.as_ref(), &*child.0.as_ref()));
-        if let Some(index) = index {
-            self.0.children.borrow_mut().remove(index);
-            self.mark_layout_dirty();
-        }
-    }
-
-    /// Removes this element from the UI tree.
-    pub fn remove(&self) {
-        if let Some(parent) = self.parent() {
-            parent.remove_child(self);
-        }
-    }
-}
-
+/*
 /// Weak reference to an element.
 #[derive(Clone)]
 pub struct WeakElement(PinWeak<ElementInner<dyn Any>>);
@@ -335,7 +322,7 @@ impl WeakElement {
     pub fn upgrade(&self) -> Option<Element<dyn Any>> {
         self.0.upgrade().map(Element)
     }
-}
+}*/
 
 /*
 /// A handle to an element in the UI tree that can be used to set its content,
@@ -367,20 +354,3 @@ impl ElementHandle {
     }
 }*/
 
-/// Delegate for the layout, rendering and hit-testing of an element.
-pub trait VisualDelegate: Any {
-    fn layout(&self, this_element: &Element, children: &[Element], box_constraints: BoxConstraints) -> Geometry;
-    fn hit_test(&self, this_element: &Element, point: Point) -> Option<Element>;
-}
-
-pub struct NullVisual;
-
-impl VisualDelegate for NullVisual {
-    fn layout(&self, _this_element: &Element, _children: &[Element], _box_constraints: BoxConstraints) -> Geometry {
-        Geometry::default()
-    }
-
-    fn hit_test(&self, _this_element: &Element, _point: Point) -> Option<Element> {
-        None
-    }
-}

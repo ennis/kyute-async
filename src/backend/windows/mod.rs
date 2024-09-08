@@ -1,32 +1,31 @@
 //! Windows implementation details
-pub mod composition;
 mod event;
+mod compositor;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-use std::{ffi::OsString, mem, time::Duration};
+use std::ffi::OsString;
+use std::mem;
+use std::time::Duration;
 use threadbound::ThreadBound;
-use windows::{
-    core::{IUnknown},
-    System::DispatcherQueueController,
-    Win32::{
-        Graphics::{
-            Direct3D::D3D_FEATURE_LEVEL_12_0,
-            Direct3D12::{
-                D3D12CreateDevice, ID3D12CommandAllocator, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
-                D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
-            },
-            DirectWrite::{DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED},
-            Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory3, DXGI_ADAPTER_DESC1},
-        },
-        System::{
-            Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
-            WinRT::{CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT},
-        },
-        UI::Input::KeyboardAndMouse::GetDoubleClickTime,
-    },
+use windows::core::{IUnknown, Interface};
+use windows::System::DispatcherQueueController;
+use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12CreateDevice, ID3D12CommandAllocator, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
 };
-use windows::core::Interface;
+use windows::Win32::Graphics::DirectWrite::{DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory3, DXGI_ADAPTER_DESC1, DXGI_CREATE_FACTORY_FLAGS};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::WinRT::{
+    CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+
+pub(crate) use compositor::DrawableSurface;
+pub(crate) use compositor::Compositor;
+pub(crate) use compositor::Layer;
 
 /////////////////////////////////////////////////////////////////////////////
 // COM wrappers
@@ -109,6 +108,14 @@ pub struct AppBackend {
     //pub(crate) wic_factory: WICImagingFactory2,
 }
 
+impl Drop for AppBackend {
+    fn drop(&mut self) {
+        unsafe {
+            //self.d3d12_device.0.
+        }
+    }
+}
+
 impl AppBackend {
     pub(crate) fn new() -> AppBackend {
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).unwrap() };
@@ -134,7 +141,8 @@ impl AppBackend {
         // DXGI Factory and adapter enumeration
 
         // SAFETY: the paramters are valid
-        let dxgi_factory = unsafe { DXGIFactory3(CreateDXGIFactory2::<IDXGIFactory3>(DXGI_CREATE_FACTORY_FLAGS::empty()).unwrap()) };
+        let dxgi_factory =
+            unsafe { DXGIFactory3(CreateDXGIFactory2::<IDXGIFactory3>(DXGI_CREATE_FACTORY_FLAGS::default()).unwrap()) };
 
         // --- Enumerate adapters
         let mut adapters = Vec::new();
@@ -148,8 +156,7 @@ impl AppBackend {
 
         let mut chosen_adapter = None;
         for adapter in adapters.iter() {
-            let mut desc = DXGI_ADAPTER_DESC1::default();
-            unsafe { adapter.GetDesc1(&mut desc).unwrap() };
+            let desc = unsafe { adapter.GetDesc1().unwrap() };
 
             use std::os::windows::ffi::OsStringExt;
 

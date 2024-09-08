@@ -1,5 +1,8 @@
-use crate::{backend::AppBackend, compositor::Compositor, skia_backend};
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use crate::backend::AppBackend;
+use crate::compositor::Compositor;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
 
 //==================================================================================================
 
@@ -8,7 +11,6 @@ use std::{cell::RefCell, rc::Rc, time::Duration};
 /// Stuff that would be too complicated/impractical/ugly to carry and pass around as parameters.
 pub struct AppGlobals {
     pub(crate) backend: AppBackend,
-    pub(crate) drawing: skia_backend::DrawingBackend,
     pub compositor: Compositor,
 }
 
@@ -19,20 +21,10 @@ thread_local! {
 impl AppGlobals {
     /// Creates a new `Application` instance.
     pub fn new() -> Rc<AppGlobals> {
-        // Create glazier Application.
-        // This ensures that we're not calling `Application::new()` multiple times before `run`.
-        //let _ = glazier::Application::new().expect("an application should not already be active");
-
         // TODO: make sure that we're not making multiple applications
-
         let backend = AppBackend::new();
-        let drawing = skia_backend::DrawingBackend::new(&backend);
         let compositor = Compositor::new(&backend);
-        let app = Rc::new(AppGlobals {
-            drawing,
-            backend,
-            compositor,
-        });
+        let app = Rc::new(AppGlobals { backend, compositor });
 
         APP_GLOBALS.with(|g| g.replace(Some(app.clone())));
         app
@@ -48,6 +40,10 @@ impl AppGlobals {
 
     pub fn double_click_time(&self) -> Duration {
         self.backend.double_click_time()
+    }
+
+    pub fn teardown() {
+        APP_GLOBALS.with(|g| g.replace(None));
     }
 
     /// Returns the vulkan device instance.

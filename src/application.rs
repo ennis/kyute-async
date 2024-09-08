@@ -20,6 +20,7 @@ use winit::{
     window::WindowId,
 };
 use winit::event_loop::EventLoopProxy;
+use crate::app_globals::AppGlobals;
 
 /// Event loop user event.
 #[derive(Clone, Debug)]
@@ -90,7 +91,7 @@ pub fn run(root_future: impl Future<Output = ()> + 'static) -> Result<(), anyhow
 
     EVENT_LOOP_PROXY.set(event_loop.create_proxy()).expect("run was called twice");
 
-    //AppGlobals::new();
+    AppGlobals::new();
 
     event_loop.set_control_flow(ControlFlow::Wait);
     let _event_loop_start_time = Instant::now();
@@ -138,5 +139,6 @@ pub fn run(root_future: impl Future<Output = ()> + 'static) -> Result<(), anyhow
         Ok(())
     });
 
+    AppGlobals::teardown();
     result
 }
