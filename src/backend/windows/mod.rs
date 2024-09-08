@@ -1,31 +1,36 @@
 //! Windows implementation details
-mod event;
-mod compositor;
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
+use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::mem;
+use std::ops::Deref;
+use std::rc::Rc;
 use std::time::Duration;
+
+use skia_safe::gpu::Protected;
 use threadbound::ThreadBound;
-use windows::core::{IUnknown, Interface};
+use windows::core::{IUnknown, Interface, Owned};
 use windows::System::DispatcherQueueController;
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12CreateDevice, ID3D12CommandAllocator, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
-    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_FENCE_FLAG_NONE,
 };
 use windows::Win32::Graphics::DirectWrite::{DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED};
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory3, DXGI_ADAPTER_DESC1, DXGI_CREATE_FACTORY_FLAGS};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory2, DXGIGetDebugInterface1, IDXGIAdapter1, IDXGIDebug1, IDXGIFactory3, DXGI_ADAPTER_DESC1,
+    DXGI_CREATE_FACTORY_FLAGS,
+};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows::UI::Composition::Compositor;
 
-pub(crate) use compositor::DrawableSurface;
-pub(crate) use compositor::Compositor;
-pub(crate) use compositor::Layer;
+pub(crate) use compositor::{DrawableSurface, Layer};
+mod compositor;
 
 /////////////////////////////////////////////////////////////////////////////
 // COM wrappers
@@ -91,33 +96,65 @@ sync_com_ptr_wrapper! { D3D12Fence(ID3D12Fence) }
 // AppBackend
 /////////////////////////////////////////////////////////////////////////////
 
-pub struct AppBackend {
-    pub(crate) dispatcher_queue_controller: DispatcherQueueController,
-    pub(crate) adapter: Option<IDXGIAdapter1>,
-    pub(crate) d3d12_device: D3D12Device,              // thread safe
-    pub(crate) d3d12_command_queue: D3D12CommandQueue, // thread safe
-    pub(crate) d3d12_command_allocator: ThreadBound<ID3D12CommandAllocator>,
-    pub(crate) dxgi_factory: DXGIFactory3,
-    pub(crate) dwrite_factory: DWriteFactory,
-    //pub(crate) d3d11_device: D3D11Device,
-    //pub(crate) d3d11_device_context: ID3D11DeviceContext,
-    //pub(crate) d2d_factory: D2D1Factory1,
-    // pub(crate) d2d_device: D2D1Device,
-    // FIXME: it's far too easy to clone the ID2D11DeviceContext accidentally and use it in a thread-unsafe way: maybe create it on-the-fly instead?
-    //pub(crate) d2d_device_context: D2D1DeviceContext,
-    //pub(crate) wic_factory: WICImagingFactory2,
+struct GpuFenceData {
+    fence: ID3D12Fence,
+    event: Owned<HANDLE>,
+    value: Cell<u64>,
 }
 
-impl Drop for AppBackend {
-    fn drop(&mut self) {
+struct BackendInner {
+    pub(crate) dispatcher_queue_controller: DispatcherQueueController,
+    pub(crate) adapter: IDXGIAdapter1,
+    pub(crate) d3d12_device: D3D12Device,              // thread safe
+    pub(crate) command_queue: D3D12CommandQueue, // thread safe
+    pub(crate) command_allocator: ThreadBound<ID3D12CommandAllocator>,
+    pub(crate) dxgi_factory: DXGIFactory3,
+    pub(crate) dwrite_factory: DWriteFactory,
+    /// Fence data used to synchronize GPU and CPU (see `wait_for_gpu`).
+    sync: GpuFenceData,
+    /// Windows compositor instance (Windows.UI.Composition).
+    compositor: Compositor,
+    debug: IDXGIDebug1,
+    direct_context: RefCell<skia_safe::gpu::DirectContext>,
+    //composition_graphics_device: CompositionGraphicsDevice,
+    //composition_device: IDCompositionDesktopDevice,
+}
+
+
+impl BackendInner {
+    /// Waits for submitted GPU commands to complete.
+    fn wait_for_gpu(&self) {
+        //let _span = span!("wait_for_gpu_command_completion");
         unsafe {
-            //self.d3d12_device.0.
+            let mut val = self.sync.value.get();
+            val += 1;
+            self.sync.value.set(val);
+            self.command_queue
+                .Signal(&self.sync.fence, val)
+                .expect("ID3D12CommandQueue::Signal failed");
+            if self.sync.fence.GetCompletedValue() < val {
+                self.sync
+                    .fence
+                    .SetEventOnCompletion(val, *self.sync.event)
+                    .expect("SetEventOnCompletion failed");
+                WaitForSingleObject(*self.sync.event, 0xFFFFFFFF);
+            }
         }
     }
 }
 
-impl AppBackend {
-    pub(crate) fn new() -> AppBackend {
+#[derive(Clone)]
+pub struct ApplicationBackend(Rc<BackendInner>);
+
+impl Drop for ApplicationBackend {
+    fn drop(&mut self) {
+        // Synchronize with the GPU when dropping the backend.
+        self.0.wait_for_gpu();
+    }
+}
+
+impl ApplicationBackend {
+    pub(crate) fn new() -> ApplicationBackend {
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).unwrap() };
 
         // Dispatcher queue
@@ -178,18 +215,18 @@ impl AppBackend {
                 chosen_adapter = Some(adapter.clone())
             }
         }
+        let adapter = chosen_adapter.expect("no suitable video adapter found");
 
         //=========================================================
         // D3D12 stuff
 
+        let debug = unsafe { DXGIGetDebugInterface1(0).unwrap() };
+
         let d3d12_device = unsafe {
             let mut d3d12_device: Option<ID3D12Device> = None;
-            let adapter = chosen_adapter
-                .as_ref()
-                .map(|adapter| adapter.cast::<IUnknown>().unwrap());
             D3D12CreateDevice(
                 // pAdapter:
-                adapter.as_ref(),
+                &adapter.cast::<IUnknown>().unwrap(),
                 // MinimumFeatureLevel:
                 D3D_FEATURE_LEVEL_12_0,
                 // ppDevice:
@@ -199,7 +236,7 @@ impl AppBackend {
             D3D12Device(d3d12_device.unwrap())
         };
 
-        let d3d12_command_queue = unsafe {
+        let command_queue = unsafe {
             let cqdesc = D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
                 Priority: 0,
@@ -213,7 +250,7 @@ impl AppBackend {
             D3D12CommandQueue(cq)
         };
 
-        let d3d12_command_allocator = unsafe {
+        let command_allocator = unsafe {
             let command_allocator = d3d12_device
                 .0
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
@@ -221,16 +258,56 @@ impl AppBackend {
             ThreadBound::new(command_allocator)
         };
 
-        AppBackend {
+        //=========================================================
+        // Compositor
+
+        let direct_context = unsafe {
+            // SAFETY: backend_context is valid I guess?
+            skia_safe::gpu::DirectContext::new_d3d(
+                &skia_safe::gpu::d3d::BackendContext {
+                    adapter: adapter.clone(),
+                    device: d3d12_device.0.clone(),
+                    queue: command_queue.0.clone(),
+                    memory_allocator: None,
+                    protected_context: Protected::No,
+                },
+                None,
+            )
+            .expect("failed to create skia context")
+        };
+
+        let compositor = Compositor::new().expect("failed to create compositor");
+
+        let sync = {
+            let fence = unsafe {
+                d3d12_device
+                    .CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)
+                    .expect("CreateFence failed")
+            };
+            let event = unsafe { Owned::new(CreateEventW(None, false, false, None).unwrap()) };
+
+            GpuFenceData {
+                fence,
+                event,
+                value: Cell::new(0),
+            }
+        };
+
+        ApplicationBackend(Rc::new(BackendInner {
             d3d12_device,
-            d3d12_command_queue,
-            d3d12_command_allocator,
+            command_queue,
+            command_allocator,
             dxgi_factory,
             dwrite_factory,
             dispatcher_queue_controller,
-            adapter: chosen_adapter,
-        }
+            adapter,
+            compositor,
+            sync,
+            debug,
+            direct_context: RefCell::new(direct_context),
+        }))
     }
+
 
     /// Returns the system double click time in milliseconds.
     pub(crate) fn double_click_time(&self) -> Duration {

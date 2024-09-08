@@ -1,55 +1,9 @@
 //! System compositor interface
-//!
-//! TODO: Rc handles for layers (Rc<Compositor>)
-//! TODO: DrawableSurface should have Rc handle semantics
-use crate::{backend, Size};
 use raw_window_handle::RawWindowHandle;
 use skia_safe as sk;
-use slotmap::{SecondaryMap, SlotMap};
-use std::cell::RefCell;
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-slotmap::new_key_type! {
-    /// Unique identifier for a compositor layer.
-    pub struct LayerID;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#[derive(Copy, Clone, Debug)]
-struct LayerInfo {}
-
-#[derive(Copy, Clone, Debug)]
-struct TreeInfo {
-    parent: Option<LayerID>,
-    prev_sibling: Option<LayerID>,
-    next_sibling: Option<LayerID>,
-}
-
-#[derive(Copy, Clone, Debug, Default)]
-struct ContainerInfo {
-    first_child: Option<LayerID>,
-    last_child: Option<LayerID>,
-}
-
-#[derive(Copy, Clone, Debug)]
-struct EffectInfo {
-    opacity: f32,
-}
-
-#[derive(Copy, Clone, Debug)]
-struct TransformInfo {
-    transform: kurbo::Affine,
-}
-
-#[derive(Copy, Clone, Debug)]
-struct ClipLayer {
-    bounds: kurbo::Rect,
-}
-
-#[derive(Copy, Clone, Debug)]
-struct SurfaceInfo {}
+use crate::{backend, Size};
+use crate::app_globals::AppGlobals;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -118,7 +72,6 @@ impl ColorType {
 }
 
 /// Handle to a compositor layer.
-#[derive(Clone)]
 pub struct Layer(backend::Layer);
 
 impl Layer {
@@ -132,7 +85,16 @@ impl Layer {
     /// Creates a skia drawing context to paint on the specified surface layer.
     ///
     /// Only one drawing context can be active at a time.
+    ///
+    /// # Panics
+    /// - if the DrawableSurface returned by the last call to `acquire_drawing_surface` has not been dropped (TODO)
+    ///
     pub fn acquire_drawing_surface(&self) -> DrawableSurface {
+        // In theory, we could return a DrawableSurface that mutably borrows the Layer, to
+        // statically prevent calling `acquire_drawing_surface` when a DrawableSurface is alive.
+        // However, this would lock all `&self` methods for the duration of the borrow, which
+        // is not very ergonomic (methods like `size()` would be inaccessible, even though
+        // it's perfectly OK to call while a DrawableSurface is active).
         DrawableSurface {
             backend: self.0.acquire_drawing_surface(),
         }
@@ -147,18 +109,6 @@ impl Layer {
     pub unsafe fn bind_to_window(&self, window: RawWindowHandle) {
         self.0.bind_to_window(window)
     }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// A connection to the system compositor.
-pub struct Compositor { pub(crate) backend:  backend::Compositor }
-
-impl Compositor {
-    pub(crate) fn new(app_backend: &backend::AppBackend) -> Compositor {
-        let backend = backend::Compositor::new(app_backend);
-        Compositor {backend}
-    }
 
     /// Creates a drawable surface layer.
     ///
@@ -168,8 +118,9 @@ impl Compositor {
     ///
     /// * size Size of the surface in pixels
     /// * format Pixel format
-    pub fn create_surface_layer(&self, size: Size, format: ColorType) -> Layer {
-        let b = self.backend.create_surface_layer(size, format);
-        Layer(b)
+    pub fn new_surface(size: Size, format: ColorType) -> Layer {
+        Layer(AppGlobals::get().backend.create_surface_layer(size, format))
     }
 }
+
+

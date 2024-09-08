@@ -10,7 +10,7 @@ use skia_safe::gpu::surfaces::wrap_backend_render_target;
 use windows::Win32::Graphics::Direct3D12::{D3D12_RESOURCE_STATE_RENDER_TARGET, ID3D12Resource};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
-use crate::backend::AppBackend;
+use crate::backend::ApplicationBackend;
 use crate::Size;
 
 pub(crate) struct DrawingBackend {

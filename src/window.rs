@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use futures_util::future::AbortHandle;
 use futures_util::StreamExt;
-use kurbo::Size;
+use kurbo::{Point, Size};
 use raw_window_handle::HasWindowHandle;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
@@ -11,7 +11,7 @@ use winit::platform::windows::WindowBuilderExtWindows;
 
 use crate::app_globals::AppGlobals;
 use crate::application::{spawn, with_event_loop_window_target};
-use crate::compositor::{ColorType, Layer, LayerID};
+use crate::compositor::{ColorType, Layer};
 use crate::drawing::ToSkia;
 use crate::element::Visual;
 use crate::event::{Event, PointerEvent};
@@ -25,12 +25,28 @@ struct WindowInner {
     layer: Layer,
     window: winit::window::Window,
     hidden_before_first_draw: Cell<bool>,
+    cursor_pos: Cell<Point>,
 }
 
 pub struct Window {
     shared: Rc<WindowInner>,
     /// Handle to the event dispatcher task.
     dispatcher: AbortHandle,
+}
+
+fn draw_crosshair(canvas: &skia_safe::Canvas, pos: Point) {
+    let mut paint = skia_safe::Paint::default();
+    paint.set_color(skia_safe::Color::WHITE);
+    paint.set_anti_alias(true);
+    paint.set_stroke_width(1.0);
+    paint.set_style(skia_safe::paint::Style::Stroke);
+
+    let x = pos.x as f32 + 0.5;
+    let y = pos.y as f32 + 0.5;
+    canvas.draw_line((x - 20.0, y), (x + 20.0, y), &paint);
+    canvas.draw_line((x, y - 20.0), (x, y + 20.0), &paint);
+    // draw a circle around the crosshair
+    canvas.draw_circle((x, y), 10.0, &paint);
 }
 
 impl Window {
@@ -49,10 +65,7 @@ impl Window {
 
         // Setup compositor layer
         let size = window.inner_size();
-        let app = AppGlobals::get();
-        let layer = app
-            .compositor
-            .create_surface_layer(Size::new(size.width as f64, size.height as f64), ColorType::RGBAF16);
+        let layer = Layer::new_surface(Size::new(size.width as f64, size.height as f64), ColorType::RGBAF16);
 
         let raw_window_handle = window
             .window_handle()
@@ -78,6 +91,7 @@ impl Window {
             layer,
             window,
             hidden_before_first_draw: Cell::new(true),
+            cursor_pos: Cell::new(Default::default()),
         });
 
         // spawn a task that dispatches window events to events on individual elements
@@ -87,6 +101,10 @@ impl Window {
                 while let Some(input_event) = input_events.next().await {
                     //eprintln!("input_event: {:?}", input_event);
                     match input_event {
+                        WindowEvent::CursorMoved {position, ..} => {
+                            this.cursor_pos.set(Point::new(position.x as f64, position.y as f64));
+                            this.window.request_redraw();
+                        }
                         WindowEvent::CloseRequested => {
                             this.close_requested.emit(()).await;
                         }
@@ -108,6 +126,7 @@ impl Window {
                             {
                                 let mut skia_surface = surface.surface();
                                 skia_surface.canvas().clear(Color::from_hex("#111155").to_skia());
+                                draw_crosshair(skia_surface.canvas(), this.cursor_pos.get());
                             }
 
                             /*// Now paint the UI tree.
@@ -128,11 +147,11 @@ impl Window {
 
                                 // Save debug information after painting.
                                 //self.paint_debug_info.replace(paint_ctx.debug_info);
-                            }
+                            }*/
 
                             // Nothing more to paint, release the surface.
                             //
-                            // This flushes the skia command buffers, and presents the surface to the compositor.*/
+                            // This flushes the skia command buffers, and presents the surface to the compositor.
                             drop(surface);
 
                             // Windows are initially created hidden, and are only shown after the first frame is painted.
