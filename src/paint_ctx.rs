@@ -62,7 +62,7 @@ impl<'a> PaintCtx<'a> {
         widget.paint(self)
     }*/
 
-    pub fn with_canvas<F, R>(&mut self, f: F) -> R
+    pub fn with_canvas<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&skia_safe::Canvas) -> R,
     {

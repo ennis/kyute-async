@@ -28,6 +28,7 @@ use windows::Win32::System::WinRT::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::UI::Composition::Compositor;
+use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice3, IDCompositionDesktopDevice};
 
 pub(crate) use compositor::{DrawableSurface, Layer};
 mod compositor;
@@ -103,7 +104,7 @@ struct GpuFenceData {
 }
 
 struct BackendInner {
-    pub(crate) dispatcher_queue_controller: DispatcherQueueController,
+    //pub(crate) dispatcher_queue_controller: DispatcherQueueController,
     pub(crate) adapter: IDXGIAdapter1,
     pub(crate) d3d12_device: D3D12Device,              // thread safe
     pub(crate) command_queue: D3D12CommandQueue, // thread safe
@@ -112,10 +113,11 @@ struct BackendInner {
     pub(crate) dwrite_factory: DWriteFactory,
     /// Fence data used to synchronize GPU and CPU (see `wait_for_gpu`).
     sync: GpuFenceData,
-    /// Windows compositor instance (Windows.UI.Composition).
-    compositor: Compositor,
+    // Windows compositor instance (Windows.UI.Composition).
+    //compositor: Compositor,
     debug: IDXGIDebug1,
     direct_context: RefCell<skia_safe::gpu::DirectContext>,
+    pub(crate) composition_device: IDCompositionDesktopDevice,
     //composition_graphics_device: CompositionGraphicsDevice,
     //composition_device: IDCompositionDesktopDevice,
 }
@@ -276,7 +278,9 @@ impl ApplicationBackend {
             .expect("failed to create skia context")
         };
 
-        let compositor = Compositor::new().expect("failed to create compositor");
+        //let compositor = Compositor::new().expect("failed to create compositor");
+
+        let composition_device = unsafe { DCompositionCreateDevice3(None).expect("failed to create composition device") };
 
         let sync = {
             let fence = unsafe {
@@ -299,9 +303,8 @@ impl ApplicationBackend {
             command_allocator,
             dxgi_factory,
             dwrite_factory,
-            dispatcher_queue_controller,
             adapter,
-            compositor,
+            composition_device,
             sync,
             debug,
             direct_context: RefCell::new(direct_context),

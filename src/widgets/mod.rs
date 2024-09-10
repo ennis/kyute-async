@@ -1,5 +1,5 @@
 mod column;
 mod padding;
-mod text;
+pub mod text;
 pub mod button;
-mod decorated_box;
+pub mod decorated_box;

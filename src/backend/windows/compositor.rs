@@ -20,25 +20,23 @@ use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandQueue, ID3D12Device, ID3D12Fence, ID3D12Object, ID3D12Resource, D3D12_FENCE_FLAG_NONE,
     D3D12_RESOURCE_STATE_RENDER_TARGET,
 };
+use windows::Win32::Graphics::DirectComposition::{IDCompositionDesktopDevice, IDCompositionDevice3, IDCompositionTarget, IDCompositionVisual3};
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_MODE_SCALING_UNSPECIFIED, DXGI_SAMPLE_DESC,
 };
-use windows::Win32::Graphics::Dxgi::{
-    DXGIGetDebugInterface1, IDXGIDebug1, IDXGIFactory3, IDXGISwapChain3, DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_DETAIL,
-    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-};
+use windows::Win32::Graphics::Dxgi::{DXGIGetDebugInterface1, IDXGIDebug1, IDXGIFactory3, IDXGISwapChain3, DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_DETAIL, DXGI_PRESENT, DXGI_SCALING_ASPECT_RATIO_STRETCH, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::System::WinRT::Composition::{ICompositorDesktopInterop, ICompositorInterop};
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
-use windows::UI::Composition::{Compositor as WinCompositor, ContainerVisual, Visual};
+use windows::UI::Composition::{CompositionStretch, Compositor as WinCompositor, ContainerVisual, Visual};
 
 use crate::app_globals::AppGlobals;
+use crate::backend::windows::BackendInner;
 use crate::backend::ApplicationBackend;
 use crate::compositor::ColorType;
 use crate::skia_backend::DrawingBackend;
 use crate::{backend, Size};
-use crate::backend::windows::BackendInner;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -51,6 +49,7 @@ struct CompositorData {
 
 /// Windows drawable surface backend.
 pub(crate) struct DrawableSurface {
+    composition_device: IDCompositionDesktopDevice,
     context: DirectContext,
     swap_chain: IDXGISwapChain3,
     surface: sk::Surface,
@@ -75,7 +74,9 @@ impl DrawableSurface {
         unsafe {
             let _span = span!("D3D12: present");
             self.swap_chain.Present(1, DXGI_PRESENT::default()).unwrap();
+            self.composition_device.Commit().unwrap();
         }
+
 
         if let Some(client) = tracy_client::Client::running() {
             client.frame_mark();
@@ -98,10 +99,10 @@ struct SwapChain {
 /// Compositor layer.
 pub struct Layer {
     app: Rc<BackendInner>,
-    visual: Visual,
+    visual: IDCompositionVisual3,
     size: Cell<Size>,
     swap_chain: Option<SwapChain>,
-    window_target: RefCell<Option<DesktopWindowTarget>>,
+    window_target: RefCell<Option<IDCompositionTarget>>,
 }
 
 impl Drop for Layer {
@@ -124,6 +125,8 @@ impl Layer {
         if width == 0 || height == 0 {
             return;
         }
+
+        self.size.set(size);
 
         if let Some(ref swap_chain) = self.swap_chain {
             // Wait for the GPU to finish using the previous swap chain buffers.
@@ -149,11 +152,6 @@ impl Layer {
                 }
             }
         }
-
-        self.size.set(size);
-        self.visual
-            .SetSize(Vector2::new(size.width as f32, size.height as f32))
-            .unwrap();
     }
 
     /// Waits for the specified surface to be ready for presentation.
@@ -196,6 +194,7 @@ impl Layer {
                 )),
             );
             DrawableSurface {
+                composition_device: self.app.composition_device.clone(),
                 context: self.app.direct_context.borrow().clone(),
                 surface,
                 swap_chain: swap_chain.inner.clone(),
@@ -215,16 +214,13 @@ impl Layer {
             RawWindowHandle::Win32(w) => w,
             _ => panic!("expected a Win32 window handle"),
         };
-        let interop = self
+        let window_target = self
             .app
-            .compositor
-            .cast::<ICompositorDesktopInterop>()
-            .expect("could not retrieve ICompositorDesktopInterop");
-        let desktop_window_target = interop
-            .CreateDesktopWindowTarget(HWND(win32_handle.hwnd.get() as *mut c_void), false)
-            .expect("could not create DesktopWindowTarget");
-        desktop_window_target.SetRoot(&self.visual).expect("SetRoot failed");
-        self.window_target.replace(Some(desktop_window_target));
+            .composition_device
+            .CreateTargetForHwnd(HWND(win32_handle.hwnd.get() as *mut c_void), false)
+            .expect("CreateTargetForHwnd failed");
+        window_target.SetRoot(&self.visual).expect("SetRoot failed");
+        self.window_target.replace(Some(window_target));
     }
 }
 
@@ -275,7 +271,7 @@ impl BackendInner {
             color_space,
             surface_props.as_ref(),
         )
-            .expect("skia surface creation failed");
+        .expect("skia surface creation failed");
         sk_surface
     }
 }
@@ -285,66 +281,61 @@ impl ApplicationBackend {
     ///
     /// FIXME: don't ignore format
     pub(crate) fn create_surface_layer(&self, size: Size, _format: ColorType) -> Layer {
-        // Create the swap chain backing the layer
-        let width = size.width as u32;
-        let height = size.height as u32;
+        unsafe {
+            // Create the swap chain backing the layer
+            let width = size.width as u32;
+            let height = size.height as u32;
 
-        assert!(width != 0 && height != 0, "surface layer cannot be zero-sized");
+            assert!(width != 0 && height != 0, "surface layer cannot be zero-sized");
 
-        // create swap chain
-        let swap_chain_desc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: width,
-            Height: height,
-            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
-            Stereo: false.into(),
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: SWAP_CHAIN_BUFFER_COUNT,
-            Scaling: DXGI_SCALING_STRETCH,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-            Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
-        };
-        let swap_chain: IDXGISwapChain3 = unsafe {
-            self.0.dxgi_factory
+            // create swap chain
+            let swap_chain_desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: width,
+                Height: height,
+                Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                Stereo: false.into(),
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: SWAP_CHAIN_BUFFER_COUNT,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+                Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
+            };
+
+            // SAFETY: FFI
+            let swap_chain: IDXGISwapChain3 = self
+                .0
+                .dxgi_factory
                 .CreateSwapChainForComposition(&*self.0.command_queue, &swap_chain_desc, None)
                 .expect("CreateSwapChainForComposition failed")
                 .cast::<IDXGISwapChain3>()
-                .unwrap()
-        };
-        let frame_latency_waitable = unsafe {
+                .unwrap();
+
+            // SAFETY: FFI
             swap_chain.SetMaximumFrameLatency(1).unwrap();
-            swap_chain.GetFrameLatencyWaitableObject()
-        };
+            let frame_latency_waitable = swap_chain.GetFrameLatencyWaitableObject();
 
-        let swap_chain = SwapChain {
-            inner: swap_chain,
-            frame_latency_waitable: unsafe { Owned::new(frame_latency_waitable) },
-        };
+            let swap_chain = SwapChain {
+                inner: swap_chain,
+                // SAFETY: we own the handle
+                frame_latency_waitable: { Owned::new(frame_latency_waitable) },
+            };
 
-        // Create the composition surface representing the swap chain in the compositor
-        let surface = unsafe {
-            self.0.compositor
-                .cast::<ICompositorInterop>()
-                .unwrap()
-                .CreateCompositionSurfaceForSwapChain(&swap_chain.inner)
-                .expect("could not create composition surface for swap chain")
-        };
+            // Create the composition surface representing the swap chain in the compositor
 
-        // Create the visual+brush holding the surface
-        let visual = self.0.compositor.CreateSpriteVisual().unwrap();
-        let brush = self.0.compositor.CreateSurfaceBrush().unwrap();
-        brush.SetSurface(&surface).unwrap();
-        visual.SetBrush(&brush).unwrap();
-        let new_size = Vector2::new(size.width as f32, size.height as f32);
-        visual.SetSize(new_size).unwrap();
 
-        Layer {
-            app: self.0.clone(),
-            visual: visual.cast().unwrap(),
-            size: Cell::new(size),
-            swap_chain: Some(swap_chain),
-            window_target: RefCell::new(None),
+            // Create the visual+brush holding the surface
+            let visual = self.0.composition_device.CreateVisual().unwrap();
+            visual.SetContent(&swap_chain.inner).unwrap();
+
+            Layer {
+                app: self.0.clone(),
+                visual: visual.cast().unwrap(),
+                size: Cell::new(size),
+                swap_chain: Some(swap_chain),
+                window_target: RefCell::new(None),
+            }
         }
     }
 }
