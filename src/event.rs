@@ -173,7 +173,7 @@ pub enum Event {
     PointerOver(PointerEvent),
     PointerOut(PointerEvent),
     PointerEnter(PointerEvent),
-    PointerExit(PointerEvent),
+    PointerLeave(PointerEvent),
     /// A keyboard event.
     Keyboard(KeyboardEvent),
     Internal(InternalEvent),
@@ -188,7 +188,7 @@ impl Event {
             | Event::PointerOver(ref mut pe)
             | Event::PointerOut(ref mut pe)
             | Event::PointerEnter(ref mut pe)
-            | Event::PointerExit(ref mut pe) => {
+            | Event::PointerLeave(ref mut pe) => {
                 let prev = pe.transform;
                 pe.transform *= *transform;
                 Some(prev)
@@ -205,7 +205,7 @@ impl Event {
             | Event::PointerOver(ref mut pe)
             | Event::PointerOut(ref mut pe)
             | Event::PointerEnter(ref mut pe)
-            | Event::PointerExit(ref mut pe) => {
+            | Event::PointerLeave(ref mut pe) => {
                 pe.transform = *transform;
             }
             _ => {}
@@ -220,7 +220,7 @@ impl Event {
             | Event::PointerOver(ref mut pe)
             | Event::PointerOut(ref mut pe)
             | Event::PointerEnter(ref mut pe)
-            | Event::PointerExit(ref mut pe) => pe.request_capture,
+            | Event::PointerLeave(ref mut pe) => pe.request_capture,
             _ => false,
         }
     }

@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use kurbo::{Point, Size};
 use crate::drawing::Decoration;
-use crate::element::{Element, Visual};
+use crate::element::{AnyVisual, Element, Visual};
 use crate::event::Event;
 use crate::layout::{BoxConstraints, Geometry};
 use crate::paint_ctx::PaintCtx;
@@ -29,6 +29,10 @@ impl<D: Decoration + 'static> DecoratedBox<D> {
     pub fn set_size(&self, size: Size) {
         self.size.set(size);
     }
+
+    pub fn set_decoration(&self, decoration: D) {
+        self.decoration.replace(decoration);
+    }
 }
 
 impl<D: Decoration + 'static> Visual for DecoratedBox<D> {
@@ -36,7 +40,12 @@ impl<D: Decoration + 'static> Visual for DecoratedBox<D> {
         &self.element
     }
 
-    fn layout(&self, constraints: &BoxConstraints) -> Geometry {
+    fn layout(&self, children: &[AnyVisual], constraints: &BoxConstraints) -> Geometry {
+        // stack children
+        for child in children {
+            child.do_layout(constraints);
+        }
+
         //let mut geometry = self.content.layout(ctx, constraints);
         // assume that the decoration expands the paint bounds
         //geometry.bounding_rect = geometry.bounding_rect.union(geometry.size.to_rect());
@@ -55,10 +64,8 @@ impl<D: Decoration + 'static> Visual for DecoratedBox<D> {
         });
     }
 
-    async fn event(&self, event: &Event)
+    async fn event(&self, event: &mut Event)
     where
         Self: Sized
     {}
-
-
 }

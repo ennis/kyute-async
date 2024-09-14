@@ -1,5 +1,5 @@
 use crate::drawing::ToSkia;
-use crate::element::{Element, Visual};
+use crate::element::{AnyVisual, Element, Visual};
 use crate::event::Event;
 use crate::layout::{BoxConstraints, Geometry};
 use crate::text::TextSpan;
@@ -34,7 +34,7 @@ impl Visual for Text {
         &self.element
     }
 
-    fn layout(&self, constraints: &BoxConstraints) -> Geometry {
+    fn layout(&self, _children: &[AnyVisual], constraints: &BoxConstraints) -> Geometry {
         // layout paragraph in available space
         let _span = span!("text layout");
 
@@ -88,7 +88,7 @@ impl Visual for Text {
         })
     }
 
-    async fn event(&self, event: &Event)
+    async fn event(&self, event: &mut Event)
     where
         Self: Sized,
     {

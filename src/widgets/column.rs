@@ -1,2 +1,0 @@
-//! Flex layout column widget.
-

@@ -6,6 +6,8 @@ use std::{
     ops::{Range, RangeBounds},
 };
 
+pub mod flex;
+
 #[derive(Copy, Clone, PartialEq)]
 #[cfg_attr(feature = "serializing", derive(serde::Deserialize))]
 /// Specifies a length, either in device-independent pixels or as a percentage of a reference length.
@@ -211,16 +213,16 @@ impl BoxConstraints {
         self.compute_length(height, self.max.height)
     }
 
-    pub fn set_width_range(&mut self, width: impl RangeBounds<f64>) {
+    pub fn intersect_width(&mut self, width: impl RangeBounds<f64>) {
         let (min, max) = range_bounds_to_lengths(width);
-        self.min.width = min;
-        self.max.width = max;
+        self.min.width = self.min.width.max(min);
+        self.max.width = self.max.width.min(max);
     }
 
-    pub fn set_height_range(&mut self, height: impl RangeBounds<f64>) {
+    pub fn intersect_height(&mut self, height: impl RangeBounds<f64>) {
         let (min, max) = range_bounds_to_lengths(height);
-        self.min.height = min;
-        self.max.height = max;
+        self.min.height = self.min.height.max(min);
+        self.max.height = self.max.height.min(max);
     }
 
     pub fn width_range(&self) -> Range<f64> {
@@ -403,11 +405,11 @@ impl Default for Geometry {
 
 /// Places the content inside a containing box with the given measurements.
 ///
-/// If this box' vertical alignment is `FirstBaseline` or `LastBaseline`,
+/// If this box vertical alignment is `FirstBaseline` or `LastBaseline`,
 /// it will be aligned to the baseline of the containing box.
 ///
 /// Returns the offset of the element box.
-pub fn place_into(
+pub fn place_child_box(
     size: Size,
     baseline: Option<f64>,
     container_size: Size,
