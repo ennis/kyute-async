@@ -1,167 +1,28 @@
-use crate::drawing::BoxShadow;
-use crate::layout::flex::Axis;
-use crate::layout::{Alignment, LengthOrPercentage};
-use crate::Color;
+use std::any::TypeId;
+use std::hash::Hash;
+
 use paste::paste;
-use std::any::{Any, TypeId};
-use std::hash::{Hash, Hasher};
-use std::rc::Rc;
 
-/*
-macro_rules! style_properties {
-    ($(
-        $(#[$group_attr:meta])* $group:ident {
-            $($(#[$attr:meta])* $name:ident($ty:ty);)*
-        }
-    )*) => {
-        paste! {
+use crate::Color;
+use crate::drawing::BoxShadow;
+use crate::layout::{Alignment, LengthOrPercentage, Sizing};
+use crate::layout::flex::Axis;
 
-            $(
-                $(#[$group_attr])*
-                #[derive(Default)]
-                pub struct $group {
-                    $($(#[$attr])* pub [<$name:snake>]: $ty,)*
-                }
-            )*
-
-            #[derive(Clone, Debug)]
-            pub enum StyleProperty {
-                $(
-                    $(
-                        $(#[$attr])*
-                        $name($ty),
-                    )*
-                )*
-            }
-
-            #[derive(Clone,Debug,Default)]
-            pub struct ComputedStylesInner {
-                $(pub [<$group:snake>]: Rc<$group>,)*
-            }
-
-            #[derive(Clone, Debug, Default)]
-            pub struct ComputedStyles(Rc<ComputedStylesInner>);
-
-            impl ComputedStyles {
-                pub fn new() -> Self {
-                    Default::default()
-                }
-
-                pub fn apply(&mut self, props: &StyleRules) {
-                    for prop in &props.props {
-                        prop.apply(self);
-                    }
-                }
-            }
-
-            impl StyleProperty {
-                pub fn apply(&self, computed: &mut ComputedStyles) {
-                    let inner = Rc::make_mut(&mut computed.0);
-                    match *self {
-                        $(
-                            $(
-                                StyleProperty::$name(value) => {
-                                    Rc::make_mut(&mut inner.[<$group:snake>]).[<$name:snake>] = value;
-                                }
-                            )*
-                        )*
-                    }
-                }
-            }
-
-            impl ComputedStyles {
-                $(
-                    $(
-                        pub fn [<$name:snake>](&self) -> $ty {
-                            self.[<$group:snake>].[<$name:snake>]
-                        }
-                        pub fn [<set_ $name:snake>](&mut self, value: $ty) {
-                            let inner = Rc::make_mut(&mut self.0);
-                            Rc::make_mut(&mut inner.[<$group:snake>]).[<$name:snake>] = value;
-                        }
-                    )*
-                )*
-            }
-
-            pub struct StyleVariant {
-                props: Vec<StyleProperty>,
-            }
-
-            impl StyleVariant {
-                pub fn new() -> Self {
-                    Self { props: Vec::new() }
-                }
-
-                pub fn add(&mut self, prop: StyleProperty) {
-                    self.props.push(prop);
-                }
-            }
-
-            impl StyleVariant {
-                $(
-                    $(
-                        pub fn [<$name:snake>](mut self, value: $ty) -> Self {
-                            self.add(StyleProperty::$name(value));
-                            self
-                        }
-                    )*
-                )*
-            }
-        }
-    }
-}
-
-style_properties!(
-    #[derive(Clone,Debug)]
-    Layout {
-        PaddingLeft(LengthOrPercentage);
-        PaddingRight(LengthOrPercentage);
-        PaddingTop(LengthOrPercentage);
-        PaddingBottom(LengthOrPercentage);
-        HorizontalAlign(Alignment);
-        VerticalAlign(Alignment);
-        Baseline(LengthOrPercentage);
-        Width(LengthOrPercentage);
-        Height(LengthOrPercentage);
-        Direction(Axis);
-        CrossAxisAlignment(Alignment);
-        MainAxisAlignment(Alignment);
-        FlexFactor(f64);
-    }
-
-    #[derive(Clone,Debug)]
-    Decoration {
-        BorderLeft(LengthOrPercentage);
-        BorderRight(LengthOrPercentage);
-        BorderTop(LengthOrPercentage);
-        BorderBottom(LengthOrPercentage);
-        BorderColor(Color);
-        BorderRadius(f64);
-    }
-
-    /*#[derive(Clone,Debug)]
-    Text {
-        FontFamily(String);
-        FontStyle(String);
-        FontWeight(u32);
-        TextColor(Color);
-    }*/
-
-    #[derive(Clone,Debug)]
-    Background {
-        Color(Color);
-    }
-);*/
 
 trait IntoStyleValue {
     fn into_style_value(self) -> StyleValue;
     fn from_style_value(value: StyleValue) -> Self;
 }
 
-macro_rules! impl_style_value {
+macro_rules! impl_style_values {
     (
         $($ty:ty, $variant:ident;)*
     ) => {
+        #[derive(Clone)]
+        enum StyleValue {
+            $($variant($ty),)*
+        }
+
         $(impl IntoStyleValue for $ty {
             fn into_style_value(self) -> StyleValue {
                 StyleValue::$variant(self)
@@ -176,43 +37,48 @@ macro_rules! impl_style_value {
     };
 }
 
-impl_style_value!(
+impl_style_values!(
     LengthOrPercentage, LengthOrPercentage;
     Alignment, Alignment;
+    crate::layout::flex::MainAxisAlignment, MainAxisAlignment;
+    crate::layout::flex::CrossAxisAlignment, CrossAxisAlignment;
     Axis, Axis;
     Color, Color;
     f64, Float;
     u32, U32;
+    bool, Bool;
     String, String;
     Style, Style;
+    Sizing, Sizing;
     Vec<BoxShadow>, BoxShadows;
+    CustomFontAxisValue, CustomFontAxisValue;
 );
 
-pub trait StyleProp: 'static {
+pub trait StyleProperty: 'static {
     type Value: IntoStyleValue;
 }
 
-macro_rules! impl_style_props {
+macro_rules! style_properties {
     (
         $($name:ident: $ty:ty;)*
     ) => {
-        paste! {
+        paste::paste! {
             $(
                 pub struct $name;
-                impl StyleProp for $name {
+                impl StyleProperty for $name {
                     type Value = $ty;
                 }
             )*
 
             pub trait StyleExt {
                 $(
-                    fn [<$name:snake>](self, value: <$name as StyleProp>::Value) -> Self;
+                    fn [<$name:snake>](self, value: <$name as StyleProperty>::Value) -> Self;
                 )*
             }
 
             impl StyleExt for Style {
                 $(
-                    fn [<$name:snake>](mut self, value: <$name as StyleProp>::Value) -> Self {
+                    fn [<$name:snake>](mut self, value: <$name as StyleProperty>::Value) -> Self {
                         self.set($name, value);
                         self
                     }
@@ -222,8 +88,7 @@ macro_rules! impl_style_props {
     };
 }
 
-// Common style properties.
-impl_style_props! {
+style_properties! {
     PaddingLeft: LengthOrPercentage;
     PaddingRight: LengthOrPercentage;
     PaddingTop: LengthOrPercentage;
@@ -231,11 +96,11 @@ impl_style_props! {
     HorizontalAlign: Alignment;
     VerticalAlign: Alignment;
     Baseline: LengthOrPercentage;
-    Width: LengthOrPercentage;
-    Height: LengthOrPercentage;
+    Width: Sizing;
+    Height: Sizing;
     Direction: Axis;
-    CrossAxisAlignment: Alignment;
-    MainAxisAlignment: Alignment;
+    CrossAxisAlignment: crate::layout::flex::CrossAxisAlignment;
+    MainAxisAlignment: crate::layout::flex::MainAxisAlignment;
     FlexFactor: f64;
     BorderLeft: LengthOrPercentage;
     BorderRight: LengthOrPercentage;
@@ -245,32 +110,20 @@ impl_style_props! {
     BorderRadius: f64;
     BackgroundColor: Color;
     BoxShadows: Vec<BoxShadow>;
+    MinWidth: LengthOrPercentage;
+    MinHeight: LengthOrPercentage;
+    MaxWidth: LengthOrPercentage;
+    MaxHeight: LengthOrPercentage;
 
-    // Text styles
-    FontFamily: String;
-    FontStyle: String;
-    FontWeight: u32;
-    TextColor: Color;
 
     // Pseudo states
     Active: Style;
     Hover: Style;
     Focus: Style;
-
 }
 
-#[derive(Clone)]
-enum StyleValue {
-    LengthOrPercentage(LengthOrPercentage),
-    Alignment(Alignment),
-    Axis(Axis),
-    Color(Color),
-    Float(f64),
-    U32(u32),
-    String(String),
-    BoxShadows(Vec<BoxShadow>),
-    Style(Style),
-}
+pub(crate) use style_properties;
+use crate::text::CustomFontAxisValue;
 
 #[derive(Clone, Default)]
 pub struct Style {
@@ -282,17 +135,17 @@ impl Style {
         Default::default()
     }
 
-    pub fn set<P: StyleProp>(&mut self, _p: P, value: P::Value) {
+    pub fn set<P: StyleProperty>(&mut self, _p: P, value: P::Value) {
         self.values.insert(TypeId::of::<P>(), value.into_style_value());
     }
 
-    pub fn get<P: StyleProp>(&self, _p: P) -> Option<P::Value> {
+    pub fn get<P: StyleProperty>(&self, _p: P) -> Option<P::Value> {
         self.values
             .get(&TypeId::of::<P>())
             .map(|v| P::Value::from_style_value(v.clone()))
     }
 
-    pub fn get_or_default<P: StyleProp>(&self, _p: P) -> P::Value
+    pub fn get_or_default<P: StyleProperty>(&self, _p: P) -> P::Value
     where
         P::Value: Default,
     {

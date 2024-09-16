@@ -121,6 +121,7 @@ pub fn run(root_future: impl Future<Output = ()> + 'static) -> Result<(), anyhow
                         window_id,
                         event: window_event,
                     } => {
+                        eprintln!("[{:?}] [{:?}]", window_id, window_event);
                         APP_STATE.with(|state| {
                             // retrieve the channel endpoint to send events to the window
                             if let Some(mut sender) = state.windows.borrow_mut().get_mut(&window_id) {

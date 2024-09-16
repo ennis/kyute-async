@@ -262,6 +262,23 @@ impl Default for Alignment {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Sizing
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub struct IntrinsicSizes {
+    pub min: Size,
+    pub max: Size,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum Sizing {
+    Length(LengthOrPercentage),
+    MinContent,
+    MaxContent,
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // Geometry
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -283,7 +300,7 @@ pub struct Geometry {
     /// Paint bounds.
     ///
     /// This is the region that is dirtied when the content and its descendants needs to be repainted.
-    /// It can be different from `bounding_rect` if the element has drawing effects that bleed outside of the bounds used for hit-testing (e.g. drop shadows).
+    /// It can be different from `bounding_rect` if the element has drawing effects that bleed outside the bounds used for hit-testing (e.g. drop shadows).
     pub paint_bounding_rect: Rect,
 }
 

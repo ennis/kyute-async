@@ -286,7 +286,7 @@ pub struct Theme {
 pub const DARK_THEME: Theme = Theme {
     dark_mode: true,
     font_size: 14.0,
-    font_family: "Inter Medium",
+    font_family: "Inter Display",
     text_color: Color::from_hex("#c8c8c8"),
     window_background_color: Color::from_hex("#515151"),
     text_background_color: Color::from_hex("#1e1e1e"),
@@ -298,7 +298,7 @@ pub const DARK_THEME: Theme = Theme {
 pub const LIGHT_THEME: Theme = Theme {
     dark_mode: false,
     font_size: 14.0,
-    font_family: "Inter Medium",
+    font_family: "Inter Display",
     text_color: Color::from_hex("#272727"),
     window_background_color: Color::from_hex("#f2f2f2"),
     text_background_color: Color::from_hex("#ffffff"),

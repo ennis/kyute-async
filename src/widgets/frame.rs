@@ -5,15 +5,21 @@ use std::rc::Rc;
 
 use kurbo::{Insets, RoundedRect, Size};
 use palette::cam16::Cam16IntoUnclamped;
+use palette::num::{Clamp, MinMax};
+use tracing::warn;
 
-use crate::{Color, drawing, PaintCtx, skia};
 use crate::drawing::{BoxShadow, Paint, ToSkia};
 use crate::element::{AnyVisual, Element, Visual};
 use crate::event::Event;
 use crate::handler::Handler;
-use crate::layout::{Alignment, BoxConstraints, Geometry, LengthOrPercentage, place_child_box, flex::do_flex_layout};
-use crate::layout::flex::{Axis, CrossAxisAlignment, FlexLayoutParams, MainAxisAlignment};
-use crate::style::{Active, BackgroundColor, Baseline, BorderBottom, BorderColor, BorderLeft, BorderRadius, BorderRight, BorderTop, BoxShadows, Focus, Height, HorizontalAlign, Hover, PaddingBottom, PaddingLeft, PaddingRight, PaddingTop, Style, VerticalAlign, Width};
+use crate::layout::flex::{do_flex_layout, Axis, CrossAxisAlignment, FlexLayoutParams, MainAxisAlignment};
+use crate::layout::{place_child_box, Alignment, BoxConstraints, Geometry, LengthOrPercentage, Sizing, IntrinsicSizes};
+use crate::style::{
+    Active, BackgroundColor, Baseline, BorderBottom, BorderColor, BorderLeft, BorderRadius, BorderRight, BorderTop,
+    BoxShadows, Direction, Focus, Height, HorizontalAlign, Hover, MaxHeight, MaxWidth, MinHeight, MinWidth,
+    PaddingBottom, PaddingLeft, PaddingRight, PaddingTop, Style, VerticalAlign, Width,
+};
+use crate::{drawing, skia, style, Color, PaintCtx};
 
 #[derive(Clone, Default)]
 pub struct ResolvedFrameStyle {
@@ -24,8 +30,8 @@ pub struct ResolvedFrameStyle {
     horizontal_align: Alignment,
     vertical_align: Alignment,
     baseline: Option<LengthOrPercentage>,
-    width: Option<LengthOrPercentage>,
-    height: Option<LengthOrPercentage>,
+    width: Option<Sizing>,
+    height: Option<Sizing>,
     border_left: LengthOrPercentage,
     border_right: LengthOrPercentage,
     border_top: LengthOrPercentage,
@@ -37,6 +43,10 @@ pub struct ResolvedFrameStyle {
     direction: Axis,
     main_axis_alignment: MainAxisAlignment,
     cross_axis_alignment: CrossAxisAlignment,
+    min_width: Option<LengthOrPercentage>,
+    max_width: Option<LengthOrPercentage>,
+    min_height: Option<LengthOrPercentage>,
+    max_height: Option<LengthOrPercentage>,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -91,6 +101,10 @@ impl Frame {
         (self as &dyn Visual).add_child(content);
     }
 
+    pub async fn clicked(&self) {
+        self.clicked.wait().await;
+    }
+
     fn calculate_style(&self) {
         if self.style_changed.get() {
             let state = self.state.get();
@@ -117,26 +131,32 @@ impl Frame {
             }
 
             let mut r = self.resolved_style.borrow_mut();
-            r.padding_left = s.get_or_default(PaddingLeft);
-            r.padding_right = s.get_or_default(PaddingRight);
-            r.padding_top = s.get_or_default(PaddingTop);
-            r.padding_bottom = s.get_or_default(PaddingBottom);
-            r.horizontal_align = s.get_or_default(HorizontalAlign);
-            r.vertical_align = s.get_or_default(VerticalAlign);
-            r.baseline = s.get(Baseline);
-            r.width = s.get(Width);
-            r.height = s.get(Height);
-            r.border_left = s.get_or_default(BorderLeft);
-            r.border_right = s.get_or_default(BorderRight);
-            r.border_top = s.get_or_default(BorderTop);
-            r.border_bottom = s.get_or_default(BorderBottom);
-            r.border_color = s.get_or_default(BorderColor);
-            r.border_radius = s.get_or_default(BorderRadius);
-            r.shadows = s.get_or_default(BoxShadows);
-            r.direction = Axis::Horizontal;
-            r.main_axis_alignment = MainAxisAlignment::Start;
-            r.cross_axis_alignment = CrossAxisAlignment::Start;
-            r.background_color = s.get_or_default(BackgroundColor);
+            *r = ResolvedFrameStyle {
+                padding_left: s.get_or_default(PaddingLeft),
+                padding_right: s.get_or_default(PaddingRight),
+                padding_top: s.get_or_default(PaddingTop),
+                padding_bottom: s.get_or_default(PaddingBottom),
+                horizontal_align: s.get_or_default(HorizontalAlign),
+                vertical_align: s.get_or_default(VerticalAlign),
+                baseline: s.get(Baseline),
+                width: s.get(Width),
+                height: s.get(Height),
+                border_left: s.get_or_default(BorderLeft),
+                border_right: s.get_or_default(BorderRight),
+                border_top: s.get_or_default(BorderTop),
+                border_bottom: s.get_or_default(BorderBottom),
+                border_color: s.get_or_default(BorderColor),
+                border_radius: s.get_or_default(BorderRadius),
+                background_color: s.get_or_default(BackgroundColor),
+                shadows: s.get_or_default(BoxShadows),
+                direction: s.get_or_default(Direction),
+                main_axis_alignment: s.get_or_default(style::MainAxisAlignment),
+                cross_axis_alignment: s.get_or_default(style::CrossAxisAlignment),
+                min_width: s.get(MinWidth),
+                max_width: s.get(MaxWidth),
+                min_height: s.get(MinHeight),
+                max_height: s.get(MaxHeight),
+            };
 
             self.state_affects_style.set(state_affects_style);
             self.style_changed.set(false);
@@ -147,35 +167,99 @@ impl Frame {
 struct FrameSizes {
     parent_min: f64,
     parent_max: f64,
-    fixed: Option<f64>,
+    content_min: f64,
+    content_max: f64,
+    self_min: Option<f64>,
+    self_max: Option<f64>,
+    fixed: Option<Sizing>,
     padding_before: f64,
     padding_after: f64,
 }
 
 impl FrameSizes {
     fn compute_child_constraint(&self) -> (f64, f64) {
-        let mut min = self.parent_min;
-        let mut max = self.parent_max;
+        assert!(self.parent_min <= self.parent_max);
+
+        /*// sanity check
+        if let (Some(ref mut min), Some(ref mut max)) = (self.self_min, self.self_max) {
+            if *min > *max {
+                warn!("min width is greater than max width");
+                *min = *max;
+            }
+        }*/
+
+        let padding = self.padding_before + self.padding_after;
+
+        let mut min = self.self_min.unwrap_or(0.0).max(self.parent_min);
+        let mut max = self.self_max.unwrap_or(f64::INFINITY).min(self.parent_max);
+
+        // apply fixed width
         if let Some(fixed) = self.fixed {
-            max = fixed;
+            let w = match fixed {
+                Sizing::Length(len) => len.resolve(self.parent_max),
+                Sizing::MinContent => self.content_min + padding,
+                Sizing::MaxContent => self.content_max + padding,
+            };
+            let w = w.clamp(min, max);
+            min = w;
+            max = w;
         }
-        max -= self.padding_before + self.padding_after;
-        max = max.min(self.parent_max);
-        min = min.min(max);
+
+        // deflate by padding
+        min -= padding;
+        max -= padding;
+        min = min.max(0.0);
+        max = max.max(0.0);
         (min, max)
     }
 
     fn compute_self_size(&self, child_len: f64) -> f64 {
         let mut size = child_len;
+        let padding = self.padding_before + self.padding_after;
         if let Some(fixed) = self.fixed {
-            size = fixed;
+            size = match fixed {
+                Sizing::Length(len) => len.resolve(self.parent_max),
+                Sizing::MinContent => self.content_min + padding,
+                Sizing::MaxContent => self.content_max + padding,
+            };
         } else {
-            size += self.padding_before + self.padding_after;
+            size += padding;
         }
-        // this may be redundant
-        size = size.clamp(self.parent_min, self.parent_max);
+        // apply min and max width
+        let min = self.parent_min.max(self.self_min.unwrap_or(0.0));
+        let max = self.parent_max.min(self.self_max.unwrap_or(f64::INFINITY));
+        size = size.clamp(min, max);
         size
     }
+}
+
+fn compute_intrinsic_sizes(direction: Axis, children: &[AnyVisual]) -> IntrinsicSizes {
+    let mut isizes = IntrinsicSizes::default();
+    for c in children.iter() {
+        let s = c.intrinsic_sizes();
+        match direction {
+            Axis::Horizontal => {
+                // horizontal layout
+                // width is sum of all children
+                // height is max of all children
+                isizes.min.width += s.min.width;
+                isizes.max.width += s.max.width;
+                isizes.min.height = isizes.min.height.max(s.min.height);
+                isizes.max.height = isizes.max.height.max(s.max.height);
+
+            }
+            Axis::Vertical => {
+                // vertical layout
+                // width is max of all children
+                // height is sum of all children
+                isizes.min.height += s.min.height;
+                isizes.max.height += s.max.height;
+                isizes.min.width = isizes.min.width.max(s.min.width);
+                isizes.max.width = isizes.max.width.max(s.max.width);
+            }
+        }
+    }
+    isizes
 }
 
 impl Visual for Frame {
@@ -184,17 +268,27 @@ impl Visual for Frame {
     }
 
     fn layout(&self, children: &[AnyVisual], constraints: &BoxConstraints) -> Geometry {
-
         self.calculate_style();
         let s = self.resolved_style.borrow();
 
         let max_width = constraints.max.width;
         let max_height = constraints.max.height;
 
+        let mut intrinsic_sizes = IntrinsicSizes::default();
+        if matches!(s.width, Some(Sizing::MaxContent | Sizing::MinContent)) ||
+            matches!(s.height, Some(Sizing::MaxContent | Sizing::MinContent)) {
+            // we need to compute the intrinsic size of the content
+            intrinsic_sizes = compute_intrinsic_sizes(s.direction, children);
+        }
+
         let horizontal = FrameSizes {
             parent_min: constraints.min.width,
             parent_max: constraints.max.width,
-            fixed: s.width.map(|w| w.resolve(max_width)),
+            content_min: intrinsic_sizes.min.width,
+            content_max: intrinsic_sizes.max.width,
+            self_min: s.min_width.map(|w| w.resolve(max_width)),
+            self_max: s.max_width.map(|w| w.resolve(max_width)),
+            fixed: s.width,
             padding_before: s.padding_left.resolve(max_width),
             padding_after: s.padding_right.resolve(max_width),
         };
@@ -202,7 +296,11 @@ impl Visual for Frame {
         let vertical = FrameSizes {
             parent_min: constraints.min.height,
             parent_max: constraints.max.height,
-            fixed: s.height.map(|h| h.resolve(max_height)),
+            content_min: intrinsic_sizes.min.height,
+            content_max: intrinsic_sizes.max.height,
+            self_min: s.min_height.map(|h| h.resolve(max_height)),
+            self_max: s.max_height.map(|h| h.resolve(max_height)),
+            fixed: s.height,
             padding_before: s.padding_top.resolve(max_height),
             padding_after: s.padding_bottom.resolve(max_height),
         };
@@ -265,47 +363,6 @@ impl Visual for Frame {
         }
     }
 
-    async fn event(&self, event: &mut Event)
-    where
-        Self: Sized,
-    {
-        async fn update_state(this: &Frame, state: InteractState) {
-            this.state.set(state);
-            this.state_changed.emit(state).await;
-            if this.state_affects_style.get() {
-                this.style_changed.set(true);
-                this.mark_needs_relayout();
-            }
-        }
-
-        let mut state = self.state.get();
-        match event {
-            Event::PointerDown(_) => {
-                state.active = true;
-                update_state(self, state).await;
-                self.active.emit(true).await;
-            }
-            Event::PointerUp(_) => {
-                if state.active {
-                    state.active = false;
-                    update_state(self, state).await;
-                    self.clicked.emit(()).await;
-                }
-            }
-            Event::PointerEnter(_) => {
-                state.hovered = true;
-                update_state(self, state).await;
-                self.hovered.emit(true).await;
-            }
-            Event::PointerLeave(_) => {
-                state.hovered = false;
-                update_state(self, state).await;
-                self.hovered.emit(false).await;
-            }
-            _ => {}
-        }
-    }
-
     fn paint(&self, ctx: &mut PaintCtx) {
         let size = self.element.geometry().size;
         let rect = size.to_rect();
@@ -348,6 +405,47 @@ impl Visual for Frame {
             }
         });
     }
+
+    async fn event(&self, event: &mut Event)
+    where
+        Self: Sized,
+    {
+        async fn update_state(this: &Frame, state: InteractState) {
+            this.state.set(state);
+            this.state_changed.emit(state).await;
+            if this.state_affects_style.get() {
+                this.style_changed.set(true);
+                this.mark_needs_relayout();
+            }
+        }
+
+        let mut state = self.state.get();
+        match event {
+            Event::PointerDown(_) => {
+                state.active = true;
+                update_state(self, state).await;
+                self.active.emit(true).await;
+            }
+            Event::PointerUp(_) => {
+                if state.active {
+                    state.active = false;
+                    update_state(self, state).await;
+                    self.clicked.emit(()).await;
+                }
+            }
+            Event::PointerEnter(_) => {
+                state.hovered = true;
+                update_state(self, state).await;
+                self.hovered.emit(true).await;
+            }
+            Event::PointerLeave(_) => {
+                state.hovered = false;
+                update_state(self, state).await;
+                self.hovered.emit(false).await;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[test]
@@ -366,9 +464,7 @@ fn test_im() {
     //let mut ordmap_1 = im::ordmap!{1 => 1, 3 => 3};
     //let ordmap_2 = im::ordmap!{2 => 2, 3 => 4};
 
-
     ordmap_1 = ordmap_2.union(ordmap_1);
 
     dbg!(ordmap_1);
-
 }

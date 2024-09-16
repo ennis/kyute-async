@@ -15,7 +15,7 @@ use kurbo::{Affine, Point, Vec2};
 use crate::compositor::DrawableSurface;
 
 use crate::event::Event;
-use crate::layout::{BoxConstraints, Geometry};
+use crate::layout::{BoxConstraints, Geometry, IntrinsicSizes};
 use crate::PaintCtx;
 
 bitflags! {
@@ -100,6 +100,7 @@ pub struct Element {
     name: RefCell<String>,
 
     attached_properties: RefCell<BTreeMap<TypeId, Box<dyn Any>>>,
+
     // self-referential
     // would be nice if we didn't have to allocate
     // would be nice if this was a regular task
@@ -144,10 +145,12 @@ impl Element {
     }
 
     /// Adds a child visual and sets its parent to this visual.
-    pub fn add_child(&self, child: &dyn Visual) {
+    // NOTE: pass `&Element` instead of `&dyn Visual` because deref-coercions seem to be more reliable
+    // than unsized coercions to `&dyn Visual`.
+    pub fn add_child(&self, child: &Element) {
         child.remove();
-        child.element().parent.replace(Some(self.weak_this.clone()));
-        self.children.borrow_mut().push(child.element().rc().into());
+        child.parent.replace(Some(self.weak_this.clone()));
+        self.children.borrow_mut().push(child.rc().into());
         //this.mark_layout_dirty();
     }
 
@@ -267,9 +270,20 @@ impl Element {
     }
 }
 
+
+
 /// Nodes in the visual tree.
 pub trait Visual: EventTarget {
     fn element(&self) -> &Element;
+
+    fn intrinsic_sizes(&self) -> IntrinsicSizes {
+        // TODO
+        IntrinsicSizes {
+            min: Default::default(),
+            max: Default::default(),
+        }
+    }
+
     fn layout(&self, children: &[AnyVisual], constraints: &BoxConstraints) -> Geometry {
         // The default implementation just returns the union of the geometry of the children.
         let mut geometry = Geometry::default();
@@ -283,9 +297,12 @@ pub trait Visual: EventTarget {
         }
         geometry
     }
+
+
     fn hit_test(&self, point: Point) -> bool {
         self.element().geometry.get().size.to_rect().contains(point)
     }
+
     fn paint(&self, ctx: &mut PaintCtx) {}
 
     // Why async? this is because the visual may transfer control to async event handlers

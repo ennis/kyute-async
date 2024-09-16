@@ -1,37 +1,61 @@
 use crate::drawing::ToSkia;
 use crate::element::{AnyVisual, Element, Visual};
 use crate::event::Event;
-use crate::layout::{BoxConstraints, Geometry};
-use crate::text::TextSpan;
+use crate::layout::{BoxConstraints, Geometry, IntrinsicSizes};
 use crate::PaintCtx;
 use kurbo::{Point, Size};
 use skia_safe::textlayout;
 use std::cell::{Cell, Ref, RefCell};
+use std::ops::Deref;
 use std::rc::Rc;
 use tracy_client::span;
+use crate::text::{FormattedText, TextRun};
 
 pub struct Text {
     element: Element,
-    text: TextSpan,
     relayout: Cell<bool>,
+    intrinsic_size: Cell<Option<Size>>,
     paragraph: RefCell<textlayout::Paragraph>,
 }
 
+impl Deref for Text {
+    type Target = Element;
+
+    fn deref(&self) -> &Self::Target {
+        &self.element
+    }
+}
+
 impl Text {
-    pub fn new(text: TextSpan) -> Rc<Text> {
-        let paragraph = text.build_paragraph();
+    pub fn new<'a>(text: impl IntoIterator<Item=TextRun<'a>>) -> Rc<Text> {
+        let paragraph = FormattedText::new(text).inner;
         Element::new_derived(|element| Text {
             element,
-            text,
             relayout: Cell::new(true),
+            intrinsic_size: Cell::new(None),
             paragraph: RefCell::new(paragraph),
         })
     }
+
+    fn calculate_intrinsic_size(&self) -> Size {
+        // FIXME intrinsic height
+        Size::new(self.paragraph.borrow().max_intrinsic_width() as f64, 16.0)
+    }
 }
+
 
 impl Visual for Text {
     fn element(&self) -> &Element {
         &self.element
+    }
+
+
+    fn intrinsic_sizes(&self) -> IntrinsicSizes {
+        let size = self.calculate_intrinsic_size();
+        IntrinsicSizes {
+            min: size,
+            max: size,
+        }
     }
 
     fn layout(&self, _children: &[AnyVisual], constraints: &BoxConstraints) -> Geometry {
@@ -93,4 +117,5 @@ impl Visual for Text {
         Self: Sized,
     {
     }
+
 }
