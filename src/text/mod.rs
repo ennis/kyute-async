@@ -1,17 +1,18 @@
 use bitflags::bitflags;
+use kurbo::Rect;
 use std::borrow::Cow;
 use std::cell::OnceCell;
-use std::ops::Range;
+use std::{fmt, slice};
+use std::ops::{Deref, Range};
 use std::sync::Arc;
-use kurbo::Rect;
 
 use skia_safe as sk;
 use skia_safe::font_style::{Weight, Width};
-use skia_safe::textlayout::FontCollection;
+use skia_safe::textlayout::{FontCollection, RectHeightStyle, RectWidthStyle};
 use skia_safe::{FontMgr, FontStyle};
 use tracy_client::span;
 
-use crate::drawing::ToSkia;
+use crate::drawing::{FromSkia, ToSkia};
 use crate::style::{style_properties, Style};
 use crate::Color;
 
@@ -159,57 +160,84 @@ impl<'a> TextStyle<'a> {
     }
 }
 
+/// String slice with associated styling properties.
 #[derive(Copy, Clone)]
-pub struct AttributeRange<'a> {
-    pub start: usize,
-    pub len: usize,
+pub struct AttributedRange<'a> {
+    pub str: &'a str,
     pub style: &'a TextStyle<'a>,
 }
 
-/// String slice with associated styling properties.
+/*/// Type of values produced by the `text!` macro.
 #[derive(Copy, Clone)]
 pub struct AttributedStr<'a> {
-    pub text: &'a str,
-    pub ranges: &'a [AttributeRange<'a>],
+    pub runs: &'a [AttributedRange<'a>],
+}*/
+
+pub type AttributedStr<'a> = [AttributedRange<'a>];
+
+#[doc(hidden)]
+pub fn cow_format_args(args: fmt::Arguments) -> Cow<str> {
+    match args.as_str() {
+        Some(s) => Cow::Borrowed(s),
+        None => Cow::Owned(args.to_string()),
+    }
 }
 
 #[doc(hidden)]
+#[macro_export]
 macro_rules! __text {
     // Parse styles
-    (@style rgb ($($p:expr),*) ) => {
-        (|s| s.color($crate::Color::from_rgb($($p),*)))
+    (@style($s:ident) rgb ($($p:expr),*) ) => {
+        $s.color = $crate::Color::from_rgb_u8($($p),*);
     };
 
-    (@style i ) => {
-        (|s| s.font_italic(true))
+    (@style($s:ident) hexcolor ($f:expr) ) => {
+        $s.color = $crate::Color::from_hex($f);
     };
 
-    (@style b ) => {
-        (|s| s.font_weight(700))
+    (@style($s:ident) i ) => {
+        $s.font_italic = true;
     };
 
-    (@style family ($f:expr) ) => {
-        (|s| s.font_family($f))
+    (@style($s:ident) b ) => {
+        $s.font_weight = 700;
     };
 
-    (@style size ($f:expr) ) => {
-        (|s| s.font_size($f))
+    (@style($s:ident) family ($f:expr) ) => {
+        $s.font_family = $f.into();
     };
 
-    (@style weight ($f:expr) ) => {
-        (|s| s.font_weight($f))
+    (@style($s:ident) size ($f:expr) ) => {
+        $s.font_size = $f;
     };
 
-    (@style width ($f:expr) ) => {
-        (|s| s.font_width($f))
+    (@style($s:ident) weight ($f:expr) ) => {
+        $s.font_weight = $f;
     };
 
-    (@style oblique ) => {
-        (|s| s.font_oblique(true))
+    (@style($s:ident) width ($f:expr) ) => {
+        $s.font_width = $f;
     };
 
-    (@style $($rest:tt)*) => {
+    (@style($s:ident) oblique ) => {
+        $s.font_oblique = true;
+    };
+
+    (@style($s:ident) style ($f:expr) ) => {
+        $s = $f.clone();
+    };
+
+    (@style($s:ident) $($rest:tt)*) => {
         compile_error!("Unrecognized style property");
+    };
+
+    /////////////////////////////////
+    // style stack reverser
+    (@apply_styles($s:ident) ) => {};
+
+    (@apply_styles($s:ident) ( $(($($styles:tt)*))* ) $($rest:tt)* ) => {
+         $crate::__text!(@apply_styles($s) $($rest)*);
+         $($crate::__text!(@style($s) $($styles)*);)*
     };
 
     ////////////////////
@@ -221,17 +249,21 @@ macro_rules! __text {
         ($($sty:tt)*)
         //($strlen:expr)
         ($(
-            ($acc:expr, $string:literal, $(( $($styles:tt)* ))* )
+            ($string:literal, $($styles:tt)* )
         )*)
     ) => {
-        $crate::text::AttributedStr {
-            str: ::std::concat!($($string),*),
-            ranges: &[$($crate::text::AttributeRange { start: $acc.len(), len: $string.len(), style: &{
-                let mut __s = $crate::text::TextStyle::default();
-                $(__s = $($styles)*(__s);)*
-                __s
-            }}),*],
-        }
+        [
+            $(
+            $crate::text::AttributedRange {
+                str: &*$crate::text::cow_format_args(::std::format_args!($string)),
+                style: &{
+                    let mut __s = $crate::text::TextStyle::default();
+                    $crate::__text!(@apply_styles(__s) $($styles)*);
+                    __s
+                }
+            },
+            )*
+        ]
     };
 
     ////////////////////
@@ -243,7 +275,7 @@ macro_rules! __text {
         ( ($($sty_top:tt)*) $(($($sty_rest:tt)*))* )
         ($($ranges:tt)*)
     ) => {
-        __text!(
+        $crate::__text!(
             ($($rest)*)
             ($(($($sty_rest)*))*)
             ($($ranges)*)
@@ -257,15 +289,13 @@ macro_rules! __text {
         ( $str:literal $($rest:tt)* )
         // output
         ( $(($($sty:tt)*))*)
-        ( $( ($acc:expr, $string:literal, $($range_rest:tt)* ) )*)
+        ( $($ranges:tt)* )
 
     ) => {
-        __text!(
+        $crate::__text!(
             ($($rest)*)
             ( $(($($sty)*))*)
-            ($(
-                ($acc, $string, $($range_rest)* )
-            )* ( ::std::concat!($($string),*), $str, $($($sty)*)* ))
+            ( $($ranges)* ( $str, $(($($sty)*))* ))
         )
     };
 
@@ -276,12 +306,12 @@ macro_rules! __text {
         ( $m:ident ($($mp:expr),*) $($rest:tt)* )
         // output
         ( ($($cur_style:tt)*) $($style_stack:tt)*)
-        ($($ranges:tt)*)
+        ( $($ranges:tt)* )
     ) => {
 
-        __text!(
+        $crate::__text!(
             ($($rest)*)
-            ( ( $($cur_style)* (__text!(@style $m ($($mp),*))) ) $($style_stack)*)
+            ( ( $($cur_style)* ($m ($($mp),*)) ) $($style_stack)*)
             ($($ranges)*)
         )
     };
@@ -296,9 +326,44 @@ macro_rules! __text {
         ($($ranges:tt)*)
     ) => {
 
-        __text!(
+        $crate::__text!(
             ($($rest)*)
-            ( ( $($cur_style)* (__text!(@style $m)) ) $($style_stack)*)
+            ( ( $($cur_style)* ($m) ) $($style_stack)*)
+            ($($ranges)*)
+        )
+    };
+
+    ////////////////////
+    // color modifier (literal ver.)
+    (
+        // input
+        ( # $color:literal $($rest:tt)* )
+        // output
+        ($($style_stack:tt)*)
+        ($($ranges:tt)*)
+    ) => {
+
+        $crate::__text!(
+            (hexcolor(::std::stringify!($color)) $($rest)*)
+            ($($style_stack)*)
+            ($($ranges)*)
+        )
+    };
+
+
+    ////////////////////
+    // color modifier (ident ver. when the color starts with a letter...)
+    (
+        // input
+        ( # $color:ident $($rest:tt)* )
+        // output
+        ($($style_stack:tt)*)
+        ($($ranges:tt)*)
+    ) => {
+
+        $crate::__text!(
+            (hexcolor(::std::stringify!($color)) $($rest)*)
+            ($($style_stack)*)
             ($($ranges)*)
         )
     };
@@ -314,7 +379,7 @@ macro_rules! __text {
         ($($ranges:tt)*)
     )
     => {
-        __text!(
+        $crate::__text!(
             ( $($inner)* @pop $($rest)* )
             (() $($style_stack)*)
             ($($ranges)*)
@@ -322,13 +387,12 @@ macro_rules! __text {
     };
 
     /*(@body($runs:ident,$style:ident) $str:literal $($rest:tt)*) => {
-        runs.push($crate::text::TextRun::owned(format!($str), $style.clone()));
+        runs.push($crate::text::AttributedRange::owned(format!($str), $style.clone()));
         __text! { @body($runs,$style) $($rest)* };
     };*/
-
 }
 
-/// Macro to create an array of `TextRun`s.
+/// Macro to create an array of `AttributedRange`s.
 ///
 /// # Example
 ///
@@ -336,10 +400,11 @@ macro_rules! __text {
 ///
 /// let run = text_run! { size(20.0) "Hello, world!" { b "test" } };
 ///
+#[macro_export]
 macro_rules! text {
     ( $($rest:tt)* ) => {
         {
-            __text!(
+            $crate::__text!(
                 ( $($rest)* )
                 (())
                 ()
@@ -349,15 +414,11 @@ macro_rules! text {
 }
 
 fn test_text() {
-    trace_macros!(true);
     text!(
         rgb(1,2,3) "Hello, world!"
-        { size(42) b i "test" i " world" }
+        { size(42.0) b i "test" i " world" }
         "rest"
     );
-
-
-    trace_macros!(false);
 }
 
 /// Lines of formatted (shaped and layouted) text.
@@ -377,20 +438,30 @@ impl Default for FormattedText {
 
 impl FormattedText {
     /// Creates a new formatted text object for the specified text runs (text + associated style).
-    pub fn new<'a>(text_runs: impl IntoIterator<Item = TextRun<'a>>) -> Self {
+
+    // Q: take a slice of AttributedRange? No, because the slice needs to be constructed, maybe unnecessarily.
+    // With IntoIterator this works with everything (there are no slices involved)
+
+    pub fn new<'a>(text: impl IntoIterator<Item=AttributedRange<'a>>) -> Self {
         let font_collection = get_font_collection();
         let mut text_style = sk::textlayout::TextStyle::new();
         text_style.set_font_size(16.0 as sk::scalar); // TODO default font size
         let mut paragraph_style = sk::textlayout::ParagraphStyle::new();
         paragraph_style.set_text_style(&text_style);
         let mut builder = sk::textlayout::ParagraphBuilder::new(&paragraph_style, font_collection);
-        for run in text_runs.into_iter() {
+
+        for run in text.into_iter() {
             let style = run.style.to_skia();
             builder.push_style(&style);
-            builder.add_text(&run.text);
+            builder.add_text(&run.str);
             builder.pop();
         }
+
         Self { inner: builder.build() }
+    }
+
+    pub fn from_attributed_str(text: &AttributedStr) -> Self {
+        Self::new(text.iter().cloned())
     }
 
     /// Layouts or relayouts the text under the given width constraint.
@@ -400,7 +471,8 @@ impl FormattedText {
 
     /// Returns bounding rectangles for the specified range of text, specified in byte offsets.
     pub fn get_rects_for_range(&self, range: Range<usize>) -> Vec<Rect> {
-        self.inner.get_rects_for_range(range.start as i32..range.end as i32)
+        let text_boxes = self.inner.get_rects_for_range(range, RectHeightStyle::Tight, RectWidthStyle::Tight);
+        text_boxes.iter().map(|r| Rect::from_skia(r.rect)).collect()
     }
 }
 

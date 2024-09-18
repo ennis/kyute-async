@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use kurbo::Vec2;
 
-use crate::Color;
+use crate::{Color, text};
 use crate::drawing::BoxShadow;
 use crate::element::Visual;
 use crate::layout::{Alignment, Sizing};
 use crate::layout::flex::{CrossAxisAlignment, MainAxisAlignment};
 use crate::style::{Style, StyleExt};
-use crate::text::{TextRun, TextStyle};
+use crate::text::{AttributedStr, TextStyle};
 use crate::theme::DARK_THEME;
 use crate::widgets::frame::Frame;
 use crate::widgets::text::Text;
@@ -73,9 +73,9 @@ pub fn button(label: impl Into<String>) -> Rc<Frame> {
             .font_size(theme.font_size)
             .font_family(theme.font_family)
             .color(theme.text_color);
-    let text = TextRun::owned(label, text_style);
-    let label = Text::new([text]);
+    //let text = AttributedStr { str: &label, style:& text_style };
+    let text = Text::new(&text!( style(text_style) "{label}" ));
     let mut frame = Frame::new(button_style());
-    frame.add_child(&label);
+    frame.add_child(&text);
     frame
 }

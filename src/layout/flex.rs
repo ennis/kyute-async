@@ -77,8 +77,8 @@ impl Flex {
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum Axis {
     #[default]
-    Horizontal,
     Vertical,
+    Horizontal,
 }
 
 impl Axis {

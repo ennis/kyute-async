@@ -1,6 +1,8 @@
 //! Color type
 use palette::convert::FromColorUnclamped;
-use std::{error::Error, fmt, marker::PhantomData};
+use std::error::Error;
+use std::fmt;
+use std::marker::PhantomData;
 
 /// Error emitted when parsing a hex color value.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -190,7 +192,9 @@ impl Color {
             }
             // #RGB, RGB
             &[b'#', r, g, b] | &[r, g, b] => match (nibble_from_ascii(r), nibble_from_ascii(g), nibble_from_ascii(b)) {
-                (Ok(r), Ok(g), Ok(b)) => Ok(Color::from_rgb_u8(r, g, b)),
+                (Ok(rr), Ok(gg), Ok(bb)) => {
+                    Ok(Color::from_rgb_u8((rr << 4) + rr, (gg << 4) + gg, (bb << 4) + bb))
+                }
                 _ => Err(ColorParseError),
             },
             // #RGBA, RGBA
@@ -201,7 +205,9 @@ impl Color {
                     nibble_from_ascii(b),
                     nibble_from_ascii(a),
                 ) {
-                    (Ok(r), Ok(g), Ok(b), Ok(a)) => Ok(Color::from_rgba_u8(r, g, b, a)),
+                    (Ok(r), Ok(g), Ok(b), Ok(a)) => {
+                        Ok(Color::from_rgba_u8(r << 4 + r, g << 4 + g, b << 4 + b, a << 4 + a))
+                    }
                     _ => Err(ColorParseError),
                 }
             }

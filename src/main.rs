@@ -1,5 +1,3 @@
-#![feature(type_alias_impl_trait)]
-#![feature(async_fn_track_caller)]
 #![feature(const_fn_floating_point_arithmetic)]
 #![feature(trace_macros)]
 
@@ -13,7 +11,6 @@ use tokio::select;
 pub use color::Color;
 pub use paint_ctx::PaintCtx;
 
-// kurbo reexports
 use crate::window::{Window, WindowOptions};
 
 mod app_globals;
@@ -36,19 +33,26 @@ mod widgets;
 mod window;
 //mod element;
 
+use crate::layout::flex::Axis;
 use crate::style::{Style, StyleExt};
+use crate::text::TextStyle;
+use crate::widgets::text::Text;
 use widgets::button::button;
 use widgets::frame::Frame;
 use widgets::text_edit::TextEdit;
-use crate::text::TextStyle;
+
+
 
 fn main() {
     application::run(async {
-        let main_button = button("Click me!");
+        let main_button = button("Click me!"); // &str
+
+        // want to turn it into a sequence of AttributedRange
 
         let frame = Frame::new(
             Style::new()
                 .background_color(Color::from_rgb_u8(88, 88, 88))
+                .direction(Axis::Vertical)
                 .border_radius(8.0)
                 .min_width(200.0.into())
                 .min_height(50.0.into())
@@ -67,8 +71,15 @@ fn main() {
         text_edit.set_text_style(TextStyle::default().font_family("Inter").font_size(50.0));
         text_edit.set_text("Hello, world!\nMultiline".to_string());
 
-        frame.add_child(&text_edit);
-        //frame.add_child(&main_button);
+        let value = 450;
+
+        // FIXME: this doesn't work because the macro, like format_args, borrows temporaries
+        //let attributed_text = text!( { "Hello," i "world!\n" b "This is bold" } "This is a " { rgb(255,0,0) "red" } " word\n" "Value=" i "{value}" );
+        // We could directly return `FormattedText`.
+
+        frame.add_child(&Text::new(&text!( size(12.0) family("Consolas") #EEE { "Hello," i "world!\n" b "This is bold" } "\nThis is a " { #F00 "red" } " word\n" "Value=" i "{value}" )));
+        //frame.add_child(&text_edit);
+        frame.add_child(&main_button);
 
         let window_options = WindowOptions {
             title: "Hello, world!",
@@ -84,6 +95,7 @@ fn main() {
                 _ = main_button.clicked() => {
                     if let Some(popup) = popup.take() {
                         // drop popup window
+                        eprintln!("Popup closing");
                     } else {
                         // create popup
                         let popup_options = WindowOptions {

@@ -9,7 +9,7 @@ use std::cell::{Cell, Ref, RefCell};
 use std::ops::Deref;
 use std::rc::Rc;
 use tracy_client::span;
-use crate::text::{FormattedText, TextRun};
+use crate::text::{AttributedStr, FormattedText};
 
 pub struct Text {
     element: Element,
@@ -27,8 +27,8 @@ impl Deref for Text {
 }
 
 impl Text {
-    pub fn new<'a>(text: impl IntoIterator<Item=TextRun<'a>>) -> Rc<Text> {
-        let paragraph = FormattedText::new(text).inner;
+    pub fn new(text: &AttributedStr) -> Rc<Text> {
+        let paragraph = FormattedText::from_attributed_str(text).inner;
         Element::new_derived(|element| Text {
             element,
             relayout: Cell::new(true),

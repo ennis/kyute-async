@@ -3,8 +3,8 @@ use crate::element::{AnyVisual, Element, Visual};
 use crate::event::Event;
 use crate::handler::Handler;
 use crate::layout::{BoxConstraints, Geometry, IntrinsicSizes};
-use crate::text::{FormattedText, Selection, TextRun, TextStyle};
-use crate::{Color, PaintCtx};
+use crate::text::{FormattedText, Selection, TextStyle};
+use crate::{Color, PaintCtx, text};
 use kurbo::{Point, Size};
 use skia_safe::textlayout::{RectHeightStyle, RectWidthStyle};
 use std::borrow::Cow;
@@ -45,11 +45,8 @@ struct TextEditState {
 
 impl TextEditState {
     fn rebuild_paragraph(&mut self) {
-        self.paragraph = FormattedText::new([TextRun::owned(
-            self.text.clone(),
-            self.text_style.clone())
-            ])
-        .inner;
+        let text = self.text.clone();
+        self.paragraph = FormattedText::new(text!( style(self.text_style) "{text}")).inner;;
     }
 }
 

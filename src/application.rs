@@ -1,26 +1,28 @@
 //use crate::app_globals::AppGlobals;
+use crate::app_globals::AppGlobals;
+use crate::element::Visual;
 use anyhow::Context;
-use futures::{
-    channel::mpsc::{Receiver, Sender},
-    executor,
-    executor::{LocalPool, LocalSpawner},
-    future::{abortable, AbortHandle},
-    task::{ArcWake, LocalSpawnExt},
-};
-use futures_util::SinkExt;
+use futures::channel::mpsc::{Receiver, Sender};
+use futures::executor;
+use futures::executor::{LocalPool, LocalSpawner};
+use futures::future::{abortable, AbortHandle};
+use futures::task::{ArcWake, LocalSpawnExt};
+use futures_util::future::LocalBoxFuture;
+use futures_util::{FutureExt, SinkExt};
 use scoped_tls::scoped_thread_local;
 use smallvec::SmallVec;
-use std::{cell::RefCell, collections::HashMap, fmt, future::Future, rc::Rc, sync::Arc, time::Instant};
-use std::sync::OnceLock;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::fmt;
+use std::future::Future;
+use std::rc::{Rc, Weak};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tracing::warn;
 use tracy_client::set_thread_name;
-use winit::{
-    event::Event,
-    event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopWindowTarget},
-    window::WindowId,
-};
-use winit::event_loop::EventLoopProxy;
-use crate::app_globals::AppGlobals;
+use winit::event::Event;
+use winit::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
+use winit::window::WindowId;
 
 /// Event loop user event.
 #[derive(Clone, Debug)]
@@ -35,7 +37,6 @@ pub fn wake_event_loop() {
     EVENT_LOOP_PROXY.get().unwrap().send_event(ExtEvent::UpdateUi).unwrap()
 }
 
-
 scoped_thread_local!(static EVENT_LOOP_WINDOW_TARGET: EventLoopWindowTarget<ExtEvent>);
 
 /// Accesses the current "event loop window target", which is used to create winit [winit::window::Window]s.
@@ -44,7 +45,7 @@ pub fn with_event_loop_window_target<T>(f: impl FnOnce(&EventLoopWindowTarget<Ex
 }
 
 struct AppState {
-    windows: RefCell<HashMap<WindowId, Sender<winit::event::WindowEvent>>>,
+    windows: RefCell<HashMap<WindowId, Weak<dyn WindowHandler>>>,
     spawner: LocalSpawner,
 }
 
@@ -64,17 +65,35 @@ pub fn spawn(fut: impl Future<Output = ()> + 'static) -> AbortHandle {
     })
 }
 
+pub trait WindowHandlerObjectSafe {
+    fn event_future<'a>(&'a self, event: &'a winit::event::WindowEvent) -> LocalBoxFuture<'a, ()>;
+}
+
+/// Handler for window events.
+pub trait WindowHandler: WindowHandlerObjectSafe {
+    async fn event(&self, event: &winit::event::WindowEvent)
+    where
+        Self: Sized;
+}
+
+impl<T: WindowHandler> WindowHandlerObjectSafe for T
+where
+    T: WindowHandler,
+{
+    fn event_future<'a>(&'a self, event: &'a winit::event::WindowEvent) -> LocalBoxFuture<'a, ()> {
+        self.event(event).boxed_local()
+    }
+}
+
 /// Registers a winit window with the application, and retrieves the events for the window.
 ///
 /// # Return value
 ///
 /// An async receiver used to receive events for this window.
-pub fn register_window(window_id: WindowId) -> Receiver<winit::event::WindowEvent> {
-    let (tx, rx) = futures::channel::mpsc::channel(16);
+pub fn register_window(window_id: WindowId, handler: Rc<dyn WindowHandler>) {
     APP_STATE.with(|state| {
-        state.windows.borrow_mut().insert(window_id, tx);
+        state.windows.borrow_mut().insert(window_id, Rc::downgrade(&handler));
     });
-    rx
 }
 
 pub fn quit() {
@@ -89,7 +108,9 @@ pub fn run(root_future: impl Future<Output = ()> + 'static) -> Result<(), anyhow
         .build()
         .context("failed to create the event loop")?;
 
-    EVENT_LOOP_PROXY.set(event_loop.create_proxy()).expect("run was called twice");
+    EVENT_LOOP_PROXY
+        .set(event_loop.create_proxy())
+        .expect("run was called twice");
 
     AppGlobals::new();
 
@@ -123,10 +144,16 @@ pub fn run(root_future: impl Future<Output = ()> + 'static) -> Result<(), anyhow
                     } => {
                         eprintln!("[{:?}] [{:?}]", window_id, window_event);
                         APP_STATE.with(|state| {
-                            // retrieve the channel endpoint to send events to the window
-                            if let Some(mut sender) = state.windows.borrow_mut().get_mut(&window_id) {
-                                // this will unblock tasks waiting for events
-                                let _ = sender.start_send(window_event);
+                            // Don't hold a borrow of `state.windows` across the handler since
+                            // the handler may create new windows.
+                            let handler = state.windows.borrow().get(&window_id).cloned();
+                            if let Some(handler) = handler {
+                                if let Some(handler) = handler.upgrade() {
+                                    local_pool.run_until(handler.event_future(&window_event));
+                                } else {
+                                    // remove the window if the handler has been dropped
+                                    state.windows.borrow_mut().remove(&window_id);
+                                }
                             }
                         });
                     }

@@ -5,7 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::mem;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::Instant;
@@ -22,7 +22,7 @@ use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::platform::windows::WindowBuilderExtWindows;
 
 use crate::app_globals::AppGlobals;
-use crate::application::{spawn, with_event_loop_window_target};
+use crate::application::{spawn, with_event_loop_window_target, WindowHandler};
 use crate::compositor::{ColorType, Layer};
 use crate::drawing::ToSkia;
 use crate::element::{AnyVisual, Element, HitTestEntry, Visual};
@@ -113,10 +113,11 @@ struct WindowInner {
     last_physical_size: Cell<Size>,
     input_state: RefCell<InputState>,
     background: Cell<Color>,
-    active_popup: RefCell<Option<Rc<WindowInner>>>,
+    active_popup: RefCell<Option<Weak<WindowInner>>>,
     // DEBUGGING
     last_kb_event: RefCell<Option<winit::event::KeyEvent>>,
 }
+
 impl WindowInner {
     /// Dispatches an event to a target visual in the UI tree.
     ///
@@ -311,8 +312,7 @@ impl WindowInner {
         Some(event)
     }
 
-
-    fn redirect_to_popup(&self, popup: &WindowInner, event: &WindowEvent) -> Option<WindowEvent> {
+    fn redirect_event_to_popup(&self, popup: &WindowInner, event: &WindowEvent) -> Option<WindowEvent> {
         // strategy: translate the event so that it appears to come from the popup window,
         // then directly invoke `dispatch_winit_input_event` on the popup window
         let self_client_area = {
@@ -357,15 +357,22 @@ impl WindowInner {
     }
 
     pub(crate) fn set_popup(&self, window: &Window) {
-        self.active_popup.replace(Some(window.shared.clone()));
+        self.active_popup.replace(Some(Rc::downgrade(&window.shared)));
     }
 
     /// Converts & dispatches a winit window event.
     async fn dispatch_winit_input_event(&self, event: &WindowEvent) {
-        if let Some(popup) = self.active_popup.borrow().as_ref() {
-            if let Some(redirected_event) = self.redirect_to_popup(popup, event) {
-                Box::pin(self.active_popup.borrow().as_ref().unwrap().dispatch_winit_input_event(&redirected_event)).await;
-                return;
+
+        // First, redirect the input event to the popup window if there is one.
+        let popup = self.active_popup.borrow().clone();
+        if let Some(popup) = popup {
+            if let Some(popup) = popup.upgrade() {
+                if let Some(redirected_event) = self.redirect_event_to_popup(&popup, event) {
+                    Box::pin(popup.dispatch_winit_input_event(&redirected_event)).await;
+                    return;
+                }
+            } else {
+                self.active_popup.replace(None);
             }
         }
 
@@ -395,7 +402,11 @@ impl WindowInner {
                 self.cursor_pos.set(Point::new(touch.location.x, touch.location.y));
                 self.window.request_redraw();
             }
-            WindowEvent::KeyboardInput { event, device_id, is_synthetic } => {
+            WindowEvent::KeyboardInput {
+                event,
+                device_id,
+                is_synthetic,
+            } => {
                 eprintln!("[{:?}] KeyboardInput: {:?}", self.window.id(), event);
                 self.last_kb_event.replace(Some(event.clone()));
                 self.window.request_redraw();
@@ -477,7 +488,11 @@ impl WindowInner {
             draw_crosshair(skia_surface.canvas(), self.cursor_pos.get());
 
             if let Some(event) = &*self.last_kb_event.borrow() {
-                draw_text_blob(skia_surface.canvas(), &format!("{:?} ({:?})", event.logical_key, event.physical_key), size);
+                draw_text_blob(
+                    skia_surface.canvas(),
+                    &format!("{:?} ({:?})", event.logical_key, event.physical_key),
+                    size,
+                );
             }
         }
 
@@ -503,18 +518,14 @@ impl WindowInner {
     }
 }
 
-pub struct Window {
-    shared: Rc<WindowInner>,
-    /// Handle to the event dispatcher task.
-    dispatcher: AbortHandle,
+impl WindowHandler for WindowInner {
+    async fn event(&self, event: &WindowEvent) {
+        self.dispatch_winit_input_event(event).await;
+    }
 }
 
-impl Drop for Window {
-    fn drop(&mut self) {
-        // drop the dispatcher task
-        // it holds the last reference to the window
-        self.dispatcher.abort();
-    }
+pub struct Window {
+    shared: Rc<WindowInner>,
 }
 
 pub struct WindowOptions<'a> {
@@ -584,9 +595,7 @@ impl Window {
         // see https://learn.microsoft.com/en-us/windows/uwp/gaming/reduce-latency-with-dxgi-1-3-swap-chains#step-4-wait-before-rendering-each-frame
         layer.wait_for_presentation();
 
-        // FIXME: we don't really need a channel, we could just register a trait object like we do
-        // with Visuals
-        let mut input_events = application::register_window(window.id());
+        let window_id = window.id();
         let shared = Rc::new(WindowInner {
             close_requested: Handler::new(),
             focus_changed: Handler::new(),
@@ -603,18 +612,8 @@ impl Window {
             last_kb_event: RefCell::new(None),
         });
 
-        // spawn a task that dispatches window events to events on individual elements
-        let dispatcher = {
-            let this = shared.clone();
-            spawn(async move {
-                while let Some(input_event) = input_events.next().await {
-                    // eprintln!("input_event: {:?}", input_event);
-                    this.dispatch_winit_input_event(&input_event).await;
-                }
-            })
-        };
-
-        Window { shared, dispatcher }
+        application::register_window(window_id, shared.clone());
+        Window { shared }
     }
 
     pub(crate) fn set_popup(&self, window: &Window) {
