@@ -3,7 +3,6 @@ use crate::app_globals::AppGlobals;
 use crate::element::Visual;
 use anyhow::Context;
 use futures::channel::mpsc::{Receiver, Sender};
-use futures::executor;
 use futures::executor::{LocalPool, LocalSpawner};
 use futures::future::{abortable, AbortHandle};
 use futures::task::{ArcWake, LocalSpawnExt};
@@ -14,13 +13,15 @@ use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::future::Future;
+use std::future::{poll_fn, Future};
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::task::{Poll, Waker};
+use std::time::{Duration, Instant};
 use tracing::warn;
 use tracy_client::set_thread_name;
-use winit::event::Event;
+use windows::System::IUserDeviceAssociationChangedEventArgs;
+use winit::event::{Event, StartCause};
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
 use winit::window::WindowId;
 
@@ -44,9 +45,15 @@ pub fn with_event_loop_window_target<T>(f: impl FnOnce(&EventLoopWindowTarget<Ex
     EVENT_LOOP_WINDOW_TARGET.with(|event_loop| f(&event_loop))
 }
 
+struct Timer {
+    waker: Waker,
+    deadline: Instant,
+}
+
 struct AppState {
     windows: RefCell<HashMap<WindowId, Weak<dyn WindowHandler>>>,
     spawner: LocalSpawner,
+    timers: RefCell<SmallVec<Timer, 4>>,
 }
 
 scoped_thread_local!(static APP_STATE: AppState);
@@ -102,6 +109,33 @@ pub fn quit() {
     });
 }
 
+pub async fn wait_until(deadline: Instant) {
+    let mut registered = false;
+    poll_fn(move |cx| {
+        APP_STATE.with(|state| {
+            if Instant::now() >= deadline {
+                return Poll::Ready(());
+            } else if !registered {
+                // set waker
+                let timers = &mut *state.timers.borrow_mut();
+                timers.push(Timer {
+                    waker: cx.waker().clone(),
+                    deadline,
+                });
+                registered = true;
+            }
+            Poll::Pending
+        })
+    })
+    .await
+}
+
+/// Waits for the specified duration.
+pub async fn wait_for(duration: Duration) {
+    let deadline = Instant::now() + duration;
+    wait_until(deadline).await;
+}
+
 pub fn run(root_future: impl Future<Output = ()> + 'static) -> Result<(), anyhow::Error> {
     set_thread_name!("UI thread");
     let event_loop: EventLoop<ExtEvent> = EventLoopBuilder::with_user_event()
@@ -121,6 +155,7 @@ pub fn run(root_future: impl Future<Output = ()> + 'static) -> Result<(), anyhow
     let app_state = AppState {
         windows: RefCell::new(HashMap::new()),
         spawner: local_pool.spawner(),
+        timers: RefCell::new(Default::default()),
     };
 
     let result = APP_STATE.set(&app_state, || {
@@ -136,14 +171,33 @@ pub fn run(root_future: impl Future<Output = ()> + 'static) -> Result<(), anyhow
         event_loop.run(move |event, elwt| {
             EVENT_LOOP_WINDOW_TARGET.set(elwt, || {
                 //let event_time = Instant::now().duration_since(event_loop_start_time);
-
-                match event {
-                    Event::WindowEvent {
-                        window_id,
-                        event: window_event,
-                    } => {
-                        eprintln!("[{:?}] [{:?}]", window_id, window_event);
-                        APP_STATE.with(|state| {
+                APP_STATE.with(|state| {
+                    match event {
+                        Event::NewEvents(cause) => {
+                            match cause {
+                                StartCause::ResumeTimeReached { .. }
+                                | StartCause::WaitCancelled { .. }
+                                | StartCause::Poll => {
+                                    // wake all expired timers
+                                    let timers = &mut *state.timers.borrow_mut();
+                                    let now = Instant::now();
+                                    while let Some(timer) = timers.first() {
+                                        if timer.deadline <= now {
+                                            let timer = timers.remove(0);
+                                            timer.waker.wake();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
+                                StartCause::Init => {}
+                            }
+                        }
+                        Event::WindowEvent {
+                            window_id,
+                            event: window_event,
+                        } => {
+                            eprintln!("[{:?}] [{:?}]", window_id, window_event);
                             // Don't hold a borrow of `state.windows` across the handler since
                             // the handler may create new windows.
                             let handler = state.windows.borrow().get(&window_id).cloned();
@@ -155,13 +209,23 @@ pub fn run(root_future: impl Future<Output = ()> + 'static) -> Result<(), anyhow
                                     state.windows.borrow_mut().remove(&window_id);
                                 }
                             }
-                        });
-                    }
-                    _ => {}
-                };
+                        }
+                        _ => {}
+                    };
 
-                // run tasks that were possibly unblocked as a result of propagating events
-                local_pool.run_until_stalled();
+                    // run tasks that were possibly unblocked as a result of propagating events
+                    local_pool.run_until_stalled();
+
+                    // set control flow to wait until next timer expires, or wait until next
+                    // event if there are no timers
+                    let timers = &mut **state.timers.borrow_mut();
+                    if !timers.is_empty() {
+                        timers.sort_by_key(|t| t.deadline);
+                        elwt.set_control_flow(ControlFlow::WaitUntil(timers[0].deadline));
+                    } else {
+                        elwt.set_control_flow(ControlFlow::Wait);
+                    }
+                });
             });
         })?;
         Ok(())

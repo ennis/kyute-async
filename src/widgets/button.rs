@@ -18,12 +18,12 @@ fn button_style() -> Style {
     thread_local! {
         pub static BUTTON_STYLE: Style = {
             let active = Style::new()
-                .background_color(Color::from_rgb_u8(60, 60, 60))
+                .background_color(Color::from_hex("4c3e0a"))
                 .box_shadows(vec![]);
             let focused = Style::new().border_color(DARK_THEME.accent_color);
-            let hovered = Style::new().background_color(Color::from_rgb_u8(100, 100, 100));
+            let hovered = Style::new().background_color(Color::from_hex("474029"));
             let mut s = Style::new()
-                .background_color(Color::from_rgb_u8(88, 88, 88))
+                .background_color(Color::from_hex("211e13"))
                 .border_radius(8.0)
                 //.width(Sizing::MaxContent)
                 //.height(Sizing::MaxContent)
@@ -33,7 +33,7 @@ fn button_style() -> Style {
                 .padding_right(3.0.into())
                 .padding_top(3.0.into())
                 .padding_bottom(3.0.into())
-                .border_color(Color::from_rgb_u8(49, 49, 49))
+                .border_color(Color::from_hex("4c3e0a"))
                 .border_left(1.0.into())
                 .border_right(1.0.into())
                 .border_top(1.0.into())
@@ -41,15 +41,15 @@ fn button_style() -> Style {
                 .cross_axis_alignment(CrossAxisAlignment::Center)
                 .main_axis_alignment(MainAxisAlignment::Center)
                 .box_shadows(vec![
-                    BoxShadow {
+                    /*BoxShadow {
                         color: Color::from_rgb_u8(115, 115, 115),
                         offset: Vec2::new(0.0, 1.0),
                         blur: 0.0,
                         spread: 0.0,
                         inset: true,
-                    },
+                    },*/
                     BoxShadow {
-                        color: Color::from_rgb_u8(49, 49, 49),
+                        color: Color::from_hex("4c3e0a"),
                         offset: Vec2::new(0.0, 1.0),
                         blur: 2.0,
                         spread: -1.0,
@@ -72,7 +72,7 @@ pub fn button(label: impl Into<String>) -> Rc<Frame> {
         TextStyle::new()
             .font_size(theme.font_size)
             .font_family(theme.font_family)
-            .color(theme.text_color);
+            .color(Color::from_hex("ffe580"));
     //let text = AttributedStr { str: &label, style:& text_style };
     let text = Text::new(&text!( style(text_style) "{label}" ));
     let mut frame = Frame::new(button_style());

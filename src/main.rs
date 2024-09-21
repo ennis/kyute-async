@@ -51,7 +51,7 @@ fn main() {
 
         let frame = Frame::new(
             Style::new()
-                .background_color(Color::from_rgb_u8(88, 88, 88))
+                .background_color(Color::from_hex("211e13"))
                 .direction(Axis::Vertical)
                 .border_radius(8.0)
                 .min_width(200.0.into())
@@ -60,7 +60,7 @@ fn main() {
                 .padding_right(20.0.into())
                 .padding_top(20.0.into())
                 .padding_bottom(20.0.into())
-                .border_color(Color::from_rgb_u8(49, 49, 49))
+                .border_color(Color::from_hex("5f5637"))
                 .border_left(1.0.into())
                 .border_right(1.0.into())
                 .border_top(1.0.into())
@@ -77,13 +77,14 @@ fn main() {
         //let attributed_text = text!( { "Hello," i "world!\n" b "This is bold" } "This is a " { rgb(255,0,0) "red" } " word\n" "Value=" i "{value}" );
         // We could directly return `FormattedText`.
 
-        frame.add_child(&Text::new(&text!( size(12.0) family("Consolas") #EEE { "Hello," i "world!\n" b "This is bold" } "\nThis is a " { #F00 "red" } " word\n" "Value=" i "{value}" )));
-        //frame.add_child(&text_edit);
+        frame.add_child(&Text::new(&text!( size(12.0) family("Inter") #EEE { "Hello," i "world!\n" b "This is bold" } "\nThis is a " { #F00 "red" } " word\n" "Value=" i "{value}" )));
+        frame.add_child(&text_edit);
         frame.add_child(&main_button);
 
         let window_options = WindowOptions {
             title: "Hello, world!",
             size: Size::new(800.0, 600.0),
+            background: Color::from_hex("211e13"),
             ..Default::default()
         };
 
@@ -127,6 +128,7 @@ fn main() {
                 }
                 _ = main_window.close_requested() => {
                     eprintln!("Window closed");
+                    application::quit();
                     break
                 }
                 size = main_window.resized() => {

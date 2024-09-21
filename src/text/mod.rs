@@ -486,6 +486,8 @@ impl FormattedText {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Selection {
     pub start: usize,
+    /// The end of the selection, and also the position of the caret. Not necessarily greater than start,
+    /// if the selection was made by dragging from right to left.
     pub end: usize,
 }
 
@@ -501,6 +503,9 @@ impl Selection {
     }
     pub fn empty(at: usize) -> Selection {
         Selection { start: at, end: at }
+    }
+    pub fn byte_range(&self) -> Range<usize> {
+        self.min()..self.max()
     }
 }
 

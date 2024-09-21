@@ -10,15 +10,16 @@ use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::Instant;
 
-use futures_util::future::AbortHandle;
 use futures_util::StreamExt;
+use keyboard_types::{Key, KeyboardEvent};
 use kurbo::{Affine, Point, Rect, Size};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use skia_safe::font::Edging;
 use skia_safe::{Font, FontMgr, FontStyle, Typeface};
 use tracing::info;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+use winit::event::{DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::keyboard::KeyLocation;
 use winit::platform::windows::WindowBuilderExtWindows;
 
 use crate::app_globals::AppGlobals;
@@ -26,10 +27,9 @@ use crate::application::{spawn, with_event_loop_window_target, WindowHandler};
 use crate::compositor::{ColorType, Layer};
 use crate::drawing::ToSkia;
 use crate::element::{AnyVisual, Element, HitTestEntry, Visual};
-use crate::event::{Event, PointerButton, PointerButtons, PointerEvent};
+use crate::event::{Event, key_event_to_key_code, PointerButton, PointerButtons, PointerEvent};
 use crate::handler::Handler;
 use crate::layout::BoxConstraints;
-use crate::style::BackgroundColor;
 use crate::{application, Color, PaintCtx};
 
 fn draw_crosshair(canvas: &skia_safe::Canvas, pos: Point) {
@@ -58,7 +58,7 @@ fn draw_text_blob(canvas: &skia_safe::Canvas, str: &str, size: Size) {
     font.set_subpixel(true);
     font.set_edging(Edging::SubpixelAntiAlias);
     let text_blob = skia_safe::TextBlob::from_str(str, &font).unwrap();
-    canvas.draw_text_blob(text_blob, (size.width as f32 / 2.0, size.height as f32 / 2.0), &paint);
+    canvas.draw_text_blob(text_blob, (0.0, size.height as f32 - 16.0), &paint);
 }
 
 static DEFAULT_TYPEFACE: OnceLock<Typeface> = OnceLock::new();
@@ -91,17 +91,14 @@ struct InputState {
     /// Pointer button state.
     pointer_buttons: PointerButtons,
     last_click: Option<LastClick>,
-    /// The widget currently grabbing the pointer.
-    pointer_grab: Option<AnyVisual>,
-    /// The widget that has the focus for keyboard events.
-    focus: Option<AnyVisual>,
     // Result of the previous hit-test
     last_innermost_hit: Option<AnyVisual>,
     last_hits: BTreeSet<AnyVisual>,
     //prev_hit_test_result: Vec<HitTestEntry>,
 }
 
-struct WindowInner {
+pub(crate) struct WindowInner {
+    weak_this: Weak<WindowInner>,
     close_requested: Handler<()>,
     focus_changed: Handler<bool>,
     resized: Handler<PhysicalSize<u32>>,
@@ -112,13 +109,32 @@ struct WindowInner {
     cursor_pos: Cell<Point>,
     last_physical_size: Cell<Size>,
     input_state: RefCell<InputState>,
+    /// The widget currently grabbing the pointer.
+    pointer_grab: RefCell<Option<AnyVisual>>,
+    /// The widget that has the focus for keyboard events.
+    focus: RefCell<Option<AnyVisual>>,
     background: Cell<Color>,
     active_popup: RefCell<Option<Weak<WindowInner>>>,
     // DEBUGGING
-    last_kb_event: RefCell<Option<winit::event::KeyEvent>>,
+    last_kb_event: RefCell<Option<KeyboardEvent>>,
 }
 
 impl WindowInner {
+
+    fn is_focused(&self, element: &Element) -> bool {
+        self.focus.borrow().as_ref().map(|f| f.element() as *const Element == element as *const Element).unwrap_or(false)
+    }
+
+    /*fn focused(&self) -> Option<&Element> {
+        self.focus.borrow().map(|v| v.element())
+    }*/
+
+    fn set_focus(&self, element: &Element) {
+        assert!(Weak::ptr_eq(&element.window.borrow().shared, &self.weak_this), "element must belong to this window");
+        eprintln!("set focus element {}", element.name());
+        self.focus.replace(Some(element.rc().into()));
+    }
+
     /// Dispatches an event to a target visual in the UI tree.
     ///
     /// It will first invoke the event handler of the target visual.
@@ -154,8 +170,20 @@ impl WindowInner {
         }
 
         // handle repaint
-        if self.root.needs_repaint() {
-            self.window.request_redraw();
+        // NOTE: we don't need to do that anymore, because elements call `request_redraw` themselves
+        // when they are attached to a window.
+        //if self.root.needs_repaint() {
+        //    self.window.request_redraw();
+        //}
+    }
+
+
+    /// Dispatches a keyboard event in the UI tree.
+    ///
+    /// Currently, it just sends it to the focused element, or drops it if there's no focused element.
+    async fn dispatch_keyboard_event(&self, event: Event) {
+        if let Some(ref focus) = &*self.focus.borrow() {
+            self.dispatch_event(&**focus, event, true).await;
         }
     }
 
@@ -182,7 +210,7 @@ impl WindowInner {
 
         // If something is grabbing the pointer, then the event is delivered to that element;
         // otherwise it is delivered to the innermost widget that passes the hit-test.
-        let target = input_state.pointer_grab.take().or(innermost_hit.clone());
+        let target = self.pointer_grab.take().or(innermost_hit.clone());
 
         if let Some(target) = target {
             self.dispatch_event(&*target, event, true).await;
@@ -312,6 +340,54 @@ impl WindowInner {
         Some(event)
     }
 
+    fn convert_keyboard_input(&self, key_event: &KeyEvent) -> Event {
+        let input = &mut *self.input_state.borrow_mut();
+        let (key, code) = key_event_to_key_code(&key_event);
+        // update modifiers
+        match (&key, key_event.state) {
+            (Key::Shift, ElementState::Pressed) => input.modifiers.insert(keyboard_types::Modifiers::SHIFT,),
+            (Key::Shift, ElementState::Released) => input.modifiers.remove(keyboard_types::Modifiers::SHIFT),
+            (Key::Control, ElementState::Pressed) => input.modifiers.insert(keyboard_types::Modifiers::CONTROL),
+            (Key::Control, ElementState::Released) => input.modifiers.remove(keyboard_types::Modifiers::CONTROL),
+            (Key::Alt, ElementState::Pressed) => input.modifiers.insert(keyboard_types::Modifiers::ALT),
+            (Key::Alt, ElementState::Released) => input.modifiers.remove(keyboard_types::Modifiers::ALT),
+            (Key::Meta, ElementState::Pressed) => input.modifiers.insert(keyboard_types::Modifiers::META),
+            (Key::Meta, ElementState::Released) => input.modifiers.remove(keyboard_types::Modifiers::META),
+            _ => {}
+        }
+
+        let ke =
+            KeyboardEvent {
+                state: match key_event.state {
+                    ElementState::Pressed => keyboard_types::KeyState::Down,
+                    ElementState::Released => keyboard_types::KeyState::Up,
+                },
+                key,
+                code,
+                location: match key_event.location {
+                    KeyLocation::Standard => keyboard_types::Location::Standard,
+                    KeyLocation::Left => keyboard_types::Location::Left,
+                    KeyLocation::Right => keyboard_types::Location::Right,
+                    KeyLocation::Numpad => keyboard_types::Location::Numpad,
+                },
+                modifiers: input.modifiers,
+                repeat: key_event.repeat,
+                is_composing: false,
+            };
+
+        self.last_kb_event.replace(Some(ke.clone()));
+        //eprintln!("[{:?}] key={:?}, code={:?}, modifiers={:?}", self.window.id(), key, code, input.modifiers);
+
+        match ke.state {
+            keyboard_types::KeyState::Down => {
+                Event::KeyDown(ke)
+            }
+            keyboard_types::KeyState::Up => {
+                Event::KeyUp(ke)
+            }
+        }
+    }
+
     fn redirect_event_to_popup(&self, popup: &WindowInner, event: &WindowEvent) -> Option<WindowEvent> {
         // strategy: translate the event so that it appears to come from the popup window,
         // then directly invoke `dispatch_winit_input_event` on the popup window
@@ -362,7 +438,6 @@ impl WindowInner {
 
     /// Converts & dispatches a winit window event.
     async fn dispatch_winit_input_event(&self, event: &WindowEvent) {
-
         // First, redirect the input event to the popup window if there is one.
         let popup = self.active_popup.borrow().clone();
         if let Some(popup) = popup {
@@ -396,10 +471,12 @@ impl WindowInner {
                     pos,
                 )
                 .await;
+                // force a redraw for the debug crosshair
                 self.window.request_redraw();
             }
             WindowEvent::Touch(touch) => {
                 self.cursor_pos.set(Point::new(touch.location.x, touch.location.y));
+                // force a redraw for the debug crosshair
                 self.window.request_redraw();
             }
             WindowEvent::KeyboardInput {
@@ -407,8 +484,9 @@ impl WindowInner {
                 device_id,
                 is_synthetic,
             } => {
-                eprintln!("[{:?}] KeyboardInput: {:?}", self.window.id(), event);
-                self.last_kb_event.replace(Some(event.clone()));
+                let converted_event = self.convert_keyboard_input(event);
+                self.dispatch_keyboard_event(converted_event).await;
+                // for the debugging overlay
                 self.window.request_redraw();
             }
             WindowEvent::MouseInput {
@@ -435,7 +513,7 @@ impl WindowInner {
                 self.focus_changed.emit(*focused).await;
             }
             WindowEvent::RedrawRequested => {
-                eprintln!("[{:?}] RedrawRequested", self.window.id());
+                //eprintln!("[{:?}] RedrawRequested", self.window.id());
                 self.do_redraw();
             }
             event => {
@@ -490,7 +568,7 @@ impl WindowInner {
             if let Some(event) = &*self.last_kb_event.borrow() {
                 draw_text_blob(
                     skia_surface.canvas(),
-                    &format!("{:?} ({:?})", event.logical_key, event.physical_key),
+                    &format!("{:?} ({:?}) +{:?}", event.key, event.code, event.modifiers),
                     size,
                 );
             }
@@ -526,6 +604,44 @@ impl WindowHandler for WindowInner {
 
 pub struct Window {
     shared: Rc<WindowInner>,
+}
+
+/// A weak reference to a window.
+#[derive(Clone)]
+pub struct WeakWindow {
+    pub(crate) shared: Weak<WindowInner>,
+}
+
+/*
+impl PartialEq for WeakWindow {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.shared, &other.shared)
+    }
+}*/
+
+impl Default for WeakWindow {
+    fn default() -> Self {
+        Self { shared: Weak::new() }
+    }
+}
+
+impl WeakWindow {
+    pub fn request_repaint(&self) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.window.request_redraw();
+        }
+    }
+
+    pub fn set_focus(&self, element: &Element) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.set_focus(element);
+        }
+    }
+
+    /// Returns a reference to the currently focused element.
+    pub fn is_focused(&self, element: &Element) -> bool {
+        self.shared.upgrade().map(|shared| shared.is_focused(element)).unwrap_or(false)
+    }
 }
 
 pub struct WindowOptions<'a> {
@@ -596,7 +712,8 @@ impl Window {
         layer.wait_for_presentation();
 
         let window_id = window.id();
-        let shared = Rc::new(WindowInner {
+        let shared = Rc::new_cyclic(|weak_this| WindowInner {
+            weak_this: weak_this.clone(),
             close_requested: Handler::new(),
             focus_changed: Handler::new(),
             resized: Handler::new(),
@@ -607,13 +724,32 @@ impl Window {
             cursor_pos: Cell::new(Default::default()),
             last_physical_size: Cell::new(phy_size),
             input_state: Default::default(),
+            pointer_grab: RefCell::new(None),
+            focus: RefCell::new(None),
             background: Cell::new(options.background),
             active_popup: RefCell::new(None),
             last_kb_event: RefCell::new(None),
         });
 
         application::register_window(window_id, shared.clone());
+
+        // TODO I don't really like the fact that elements themselves call back into the window
+        // to request a redraw. It would be better if the window could just listen for changes
+        // to the dirty flags.
+        let weak = Rc::downgrade(&shared);
+        root.set_parent_window(WeakWindow { shared: weak });
+
         Window { shared }
+    }
+
+    pub fn set_focus(&self, element: &Element) {
+        self.shared.set_focus(element);
+    }
+
+    pub fn as_weak(&self) -> WeakWindow {
+        WeakWindow {
+            shared: Rc::downgrade(&self.shared),
+        }
     }
 
     pub(crate) fn set_popup(&self, window: &Window) {

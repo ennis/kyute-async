@@ -6,6 +6,11 @@ pub use keyboard_types::Modifiers;
 use kurbo::Vec2;
 use kurbo::{Affine, Point};
 
+mod key_code;
+
+pub(crate) use key_code::key_event_to_key_code;
+pub(crate) use key_code::to_keyboard_type_modifiers;
+
 /// Represents the type of pointer.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum PointerType {
@@ -155,12 +160,6 @@ pub struct KeyboardEvent {
     pub is_composing: bool,
 }*/
 
-#[derive(Clone, Debug)]
-pub enum InternalEvent {
-    /// Hit-test results
-    Unmount,
-}
-
 /// Events.
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -174,9 +173,8 @@ pub enum Event {
     PointerOut(PointerEvent),
     PointerEnter(PointerEvent),
     PointerLeave(PointerEvent),
-    /// A keyboard event.
-    Keyboard(KeyboardEvent),
-    Internal(InternalEvent),
+    KeyDown(KeyboardEvent),
+    KeyUp(KeyboardEvent),
 }
 
 impl Event {
@@ -238,3 +236,4 @@ impl Event {
         r
     }
 }
+

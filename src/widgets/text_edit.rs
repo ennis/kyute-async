@@ -1,19 +1,22 @@
+use crate::application::{spawn, wait_for};
 use crate::drawing::{Paint, ToSkia};
 use crate::element::{AnyVisual, Element, Visual};
 use crate::event::Event;
 use crate::handler::Handler;
-use crate::layout::{BoxConstraints, Geometry, IntrinsicSizes};
+use crate::layout::{BoxConstraints, Geometry};
 use crate::text::{FormattedText, Selection, TextStyle};
-use crate::{Color, PaintCtx, text};
-use kurbo::{Point, Size};
+use crate::{application, text, Color, PaintCtx};
+use futures_util::future::AbortHandle;
+use kurbo::{Point, Rect, Size};
 use skia_safe::textlayout::{RectHeightStyle, RectWidthStyle};
-use std::borrow::Cow;
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use keyboard_types::Key;
 use tracing::warn;
-use unicode_segmentation::GraphemeCursor;
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 #[derive(Debug, Copy, Clone)]
 pub enum Movement {
@@ -40,13 +43,14 @@ struct TextEditState {
     last_available_width: f64,
     paragraph: skia_safe::textlayout::Paragraph,
     selection_color: Color,
+    caret_color: Color,
     relayout: bool,
 }
 
 impl TextEditState {
     fn rebuild_paragraph(&mut self) {
         let text = self.text.clone();
-        self.paragraph = FormattedText::new(text!( style(self.text_style) "{text}")).inner;;
+        self.paragraph = FormattedText::new(text!( style(self.text_style) "{text}")).inner;
     }
 }
 
@@ -56,11 +60,82 @@ pub struct TextEdit {
     selection_changed: Handler<Selection>,
     state: RefCell<TextEditState>,
     in_gesture: Cell<bool>,
+    blink_phase: Cell<bool>,
+    blink_reset: Cell<bool>,
+}
+
+const CARET_BLINK_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
+fn next_word_boundary(text: &str, offset: usize) -> usize {
+    let mut pos = offset;
+    enum State {
+        LeadingWhitespace,
+        Alnum,
+        NotAlnum,
+    }
+    let mut state = State::LeadingWhitespace;
+    for ch in text[offset..].chars() {
+        match state {
+            State::LeadingWhitespace => {
+                if !ch.is_whitespace() {
+                    if ch.is_alphanumeric() {
+                        state = State::Alnum;
+                    } else {
+                        state = State::NotAlnum;
+                    }
+                }
+            }
+            State::Alnum => {
+                if !ch.is_alphanumeric() {
+                    return pos;
+                }
+            }
+            State::NotAlnum => {
+                return pos;
+            }
+        }
+        pos += ch.len_utf8();
+    }
+    pos
+}
+
+fn prev_word_boundary(text: &str, offset: usize) -> usize {
+    let mut pos = offset;
+    enum State {
+        LeadingWhitespace,
+        Alnum,
+        NotAlnum,
+    }
+    let mut state = State::LeadingWhitespace;
+    for ch in text[..offset].chars().rev() {
+        match state {
+            State::LeadingWhitespace => {
+                if !ch.is_whitespace() {
+                    if ch.is_alphanumeric() {
+                        state = State::Alnum;
+                    } else {
+                        state = State::NotAlnum;
+                    }
+                }
+            }
+            State::Alnum => {
+                if !ch.is_alphanumeric() {
+                    return pos;
+                }
+            }
+            State::NotAlnum => {
+                return pos;
+            }
+        }
+        pos -= ch.len_utf8();
+    }
+    pos
 }
 
 impl TextEdit {
     pub fn new() -> Rc<TextEdit> {
-        Element::new_derived(|element| TextEdit {
+        let text_edit = Element::new_derived(|element| TextEdit {
             element,
             selection_changed: Handler::new(),
             state: RefCell::new(TextEditState {
@@ -70,10 +145,65 @@ impl TextEdit {
                 last_available_width: 0.0,
                 paragraph: FormattedText::default().inner,
                 selection_color: Color::from_rgba_u8(0, 0, 255, 80),
+                caret_color: Color::from_rgba_u8(255, 255, 0, 255),
                 relayout: true,
             }),
             in_gesture: Cell::new(false),
-        })
+            blink_phase: Cell::new(true),
+            blink_reset: Cell::new(false),
+        });
+
+        // spawn the caret blinker task
+        let this_weak = Rc::downgrade(&text_edit);
+        spawn(async move {
+            'task: loop {
+                eprintln!("caret blinker task");
+                // Initial delay before blinking
+                wait_for(CARET_BLINK_INITIAL_DELAY).await;
+                // blinking
+                'blink: loop {
+                    if let Some(this) = this_weak.upgrade() {
+                        if this.blink_reset.replace(false) {
+                            // reset requested
+                            this.blink_phase.set(true);
+                            this.mark_needs_repaint();
+                            break 'blink;
+                        }
+                        this.blink_phase.set(!this.blink_phase.get());
+                        this.mark_needs_repaint();
+                    } else {
+                        // text edit is dead, exit task
+                        break 'task;
+                    }
+                    wait_for(CARET_BLINK_INTERVAL).await;
+                }
+            }
+        });
+
+        text_edit
+    }
+
+    /// Resets the phase of the blinking caret.
+    pub fn reset_blink(&self) {
+        self.blink_phase.set(true);
+        self.blink_reset.set(true);
+        self.mark_needs_repaint();
+    }
+
+    pub fn set_caret_color(&self, color: Color) {
+        let this = &mut *self.state.borrow_mut();
+        if this.caret_color != color {
+            this.caret_color = color;
+            self.mark_needs_repaint();
+        }
+    }
+
+    pub fn set_selection_color(&self, color: Color) {
+        let this = &mut *self.state.borrow_mut();
+        if this.selection_color != color {
+            this.selection_color = color;
+            self.mark_needs_repaint();
+        }
     }
 
     pub fn set_text_style(&self, text_style: TextStyle) {
@@ -106,6 +236,8 @@ impl TextEdit {
 
     /// Sets the current text.
     pub fn set_text(&self, text: impl Into<String>) {
+        // TODO we could compare the previous and new text
+        // to relayout only affected lines.
         let this = &mut *self.state.borrow_mut();
         this.text = text.into();
         this.rebuild_paragraph();
@@ -143,6 +275,40 @@ impl TextEdit {
         self.mark_needs_repaint();
     }
 
+    /// Moves the cursor to the next or previous word boundary.
+    pub fn move_cursor_to_next_word(&self, keep_anchor: bool) {
+        let this = &mut *self.state.borrow_mut();
+        this.selection.end = next_word_boundary(&this.text, this.selection.end);
+        if !keep_anchor {
+            this.selection.start = this.selection.end;
+        }
+    }
+
+    pub fn move_cursor_to_prev_word(&self, keep_anchor: bool) {
+        let this = &mut *self.state.borrow_mut();
+        this.selection.end = prev_word_boundary(&this.text, this.selection.end);
+        if !keep_anchor {
+            this.selection.start = this.selection.end;
+        }
+    }
+
+    pub fn move_cursor_to_next_grapheme(&self, keep_anchor: bool) {
+        let this = &mut *self.state.borrow_mut();
+        this.selection.end = next_grapheme_cluster(&this.text, this.selection.end).unwrap_or(this.selection.end);
+        if !keep_anchor {
+            this.selection.start = this.selection.end;
+        }
+    }
+
+    pub fn move_cursor_to_prev_grapheme(&self, keep_anchor: bool) {
+        let this = &mut *self.state.borrow_mut();
+        this.selection.end = prev_grapheme_cluster(&this.text, this.selection.end).unwrap_or(this.selection.end);
+        if !keep_anchor {
+            this.selection.start = this.selection.end;
+        }
+    }
+
+    /// Selects the line under the cursor.
     pub fn select_line_under_cursor(&self) {
         let this = &mut *self.state.borrow_mut();
         let text = &this.text;
@@ -168,9 +334,6 @@ impl Deref for TextEdit {
         &self.element
     }
 }
-
-// Strategy: editing buffer
-// - one vec per line
 
 impl TextEdit {
     /*/// Moves the cursor forward or backward. Returns the new selection.
@@ -201,13 +364,10 @@ impl TextEdit {
     /*
         Text representation independent of the editor structure (paragraph).
         Input to text formatter: a list of text runs.
-
         Formatter: extract formatted lines from the text runs, and provide a mapping from
         visual position to text run index + offset.
         => basically, formatters are **line breakers**
-
         The editor can then choose to relayout only affected lines.
-
     */
 }
 
@@ -265,10 +425,18 @@ impl Visual for TextEdit {
                 canvas.draw_rect(text_box.rect, &selection_paint);
             }
 
-            //this.paragraph.
+            if self.has_focus() && self.blink_phase.get() {
+                if let Some(info) = this.paragraph.get_glyph_cluster_at(this.selection.end) {
+                    let caret_rect = Rect::from_origin_size(
+                        Point::new((info.bounds.left as f64).round(), (info.bounds.top as f64).round()),
+                        Size::new(1.0, info.bounds.height() as f64),
+                    );
+                    eprintln!("caret_rect: {:?}", caret_rect);
+                    let caret_paint = Paint::from(this.caret_color).to_sk_paint(bounds.to_rect());
+                    canvas.draw_rect(caret_rect.to_skia(), &caret_paint);
+                }
+            }
 
-            // draw cursor
-            //let cursor_pos = this.paragraph.get
         });
     }
 
@@ -290,6 +458,8 @@ impl Visual for TextEdit {
                 } else {
                     selection_changed |= self.set_cursor_at_point(pos, false);
                 }
+                self.reset_blink();
+                self.set_focus();
                 self.in_gesture.set(true);
             }
             Event::PointerMove(event) => {
@@ -297,6 +467,7 @@ impl Visual for TextEdit {
                 if self.in_gesture.get() {
                     selection_changed |= self.set_cursor_at_point(pos, true);
                 }
+                self.reset_blink();
             }
             Event::PointerUp(event) => {
                 // TODO set selection based on pointer position
@@ -304,6 +475,46 @@ impl Visual for TextEdit {
                 if self.in_gesture.get() {
                     selection_changed |= self.set_cursor_at_point(pos, true);
                     self.in_gesture.set(false);
+                }
+            }
+            Event::KeyDown(event) => {
+                let keep_anchor = event.modifiers.shift();
+                let word_nav = event.modifiers.ctrl();
+                match event.key {
+                    Key::ArrowLeft => {
+                        // TODO bidi?
+                        if word_nav {
+                            self.move_cursor_to_prev_word(keep_anchor);
+                        } else {
+                            self.move_cursor_to_prev_grapheme(keep_anchor);
+                        }
+                        selection_changed = true;
+                        self.reset_blink();
+                    }
+                    Key::ArrowRight => {
+                        if word_nav {
+                            self.move_cursor_to_next_word(keep_anchor);
+                        } else {
+                            self.move_cursor_to_next_grapheme(keep_anchor);
+                        }
+                        selection_changed = true;
+                        self.reset_blink();
+                    }
+                    Key::Character(ref s) => {
+                        // TODO don't do this, emit the changed text instead
+                        let this = &mut *self.state.borrow_mut();
+                        let mut text = this.text.clone();
+                        let selection = this.selection;
+                        text.replace_range(selection.byte_range(), &s);
+                        this.text = text;
+                        this.rebuild_paragraph();
+                        this.relayout = true;
+                        this.selection = Selection::empty(selection.min() + s.len());
+                        selection_changed = true;
+                        self.mark_needs_relayout();
+                        self.reset_blink();
+                    }
+                    _ => {}
                 }
             }
             _ => {}

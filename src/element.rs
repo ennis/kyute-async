@@ -8,14 +8,16 @@ use std::ptr;
 use std::ptr::addr_eq;
 use std::rc::{Rc, Weak};
 
+use crate::application::WindowHandler;
+use crate::compositor::DrawableSurface;
 use bitflags::bitflags;
 use futures_util::future::LocalBoxFuture;
 use futures_util::FutureExt;
 use kurbo::{Affine, Point, Vec2};
-use crate::compositor::DrawableSurface;
 
 use crate::event::Event;
 use crate::layout::{BoxConstraints, Geometry, IntrinsicSizes};
+use crate::window::WeakWindow;
 use crate::PaintCtx;
 
 bitflags! {
@@ -30,15 +32,20 @@ bitflags! {
 pub trait AttachedProperty: Any {
     type Value: Clone;
 
-    fn set(self, item: &dyn Visual, value: Self::Value) where Self: Sized {
+    fn set(self, item: &dyn Visual, value: Self::Value)
+    where
+        Self: Sized,
+    {
         item.set::<Self>(value);
     }
 
-    fn get(self, item: &dyn Visual) -> Option<Self::Value> where Self: Sized {
+    fn get(self, item: &dyn Visual) -> Option<Self::Value>
+    where
+        Self: Sized,
+    {
         item.get::<Self>()
     }
 }
-
 
 /// Wrapper over Rc<dyn Visual> that has PartialEq impl.
 #[derive(Clone)]
@@ -84,6 +91,8 @@ pub struct Element {
     _pin: PhantomPinned,
     /// Weak pointer to this element.
     weak_this: Weak<dyn Visual>,
+    /// Pointer to the parent owner window.
+    pub(crate) window: RefCell<WeakWindow>,
     /// TODO unused
     key: Cell<usize>,
     /// This element's parent.
@@ -100,7 +109,6 @@ pub struct Element {
     name: RefCell<String>,
 
     attached_properties: RefCell<BTreeMap<TypeId, Box<dyn Any>>>,
-
     // self-referential
     // would be nice if we didn't have to allocate
     // would be nice if this was a regular task
@@ -116,6 +124,7 @@ impl Element {
         Element {
             _pin: PhantomPinned,
             weak_this: weak_this.clone(),
+            window: Default::default(),
             key: Cell::new(0),
             parent: RefCell::new(None),
             transform: Cell::new(kurbo::Affine::default()),
@@ -127,13 +136,28 @@ impl Element {
         }
     }
 
+    pub(crate) fn set_parent_window(&self, window: WeakWindow) {
+        if !Weak::ptr_eq(&self.window.borrow().shared, &window.shared) {
+            self.window.replace(window.clone());
+            // recursively update the parent window of the children
+            for child in self.children.borrow().iter() {
+                child.set_parent_window(window.clone());
+            }
+        }
+    }
+
     pub fn new_derived<'a, T: Visual + 'static>(f: impl FnOnce(Element) -> T) -> Rc<T> {
         Rc::new_cyclic(move |weak: &Weak<T>| {
-            let weak : Weak<dyn Visual> = weak.clone();
+            let weak: Weak<dyn Visual> = weak.clone();
             let element = Element::new(&weak);
             let visual = f(element);
             visual
         })
+    }
+
+    /// Requests focus for the current element.
+    pub fn set_focus(&self) {
+        self.window.borrow().set_focus(self);
     }
 
     pub fn children(&self) -> Ref<[AnyVisual]> {
@@ -144,29 +168,42 @@ impl Element {
         self.geometry.get()
     }
 
+    pub fn name(&self) -> String {
+        self.name.borrow().clone()
+    }
+
+    /// Returns whether this element has focus.
+    pub fn has_focus(&self) -> bool {
+        self.window
+            .borrow()
+            .is_focused(self)
+    }
+
     /// Adds a child visual and sets its parent to this visual.
     // NOTE: pass `&Element` instead of `&dyn Visual` because deref-coercions seem to be more reliable
     // than unsized coercions to `&dyn Visual`.
     pub fn add_child(&self, child: &Element) {
         child.remove();
         child.parent.replace(Some(self.weak_this.clone()));
+        child.set_parent_window(self.window.borrow().clone());
         self.children.borrow_mut().push(child.rc().into());
-        //this.mark_layout_dirty();
+        self.mark_needs_relayout();
     }
 
     /// Removes all child visuals.
     pub fn clear_children(&self) {
         self.children.borrow_mut().clear();
-        //self.mark_layout_dirty();
+        self.mark_needs_relayout();
     }
 
     /// Removes the specified visual from the children of this visual.
+    ///
+    // We could take a `&Element` instead of `&dyn Visual` if that's more convenient for the user.
     pub fn remove_child(&self, child: &dyn Visual) {
         let index = self.children.borrow().iter().position(|c| ptr::eq(&**c, child));
-
         if let Some(index) = index {
             self.children.borrow_mut().remove(index);
-            //self.mark_layout_dirty();
+            self.mark_needs_relayout();
         }
     }
 
@@ -179,11 +216,11 @@ impl Element {
     pub fn remove(&self) {
         if let Some(parent) = self.parent() {
             let self_child = self.weak_this.as_ptr();
-            let index = self.children.borrow().iter().position(|c| ptr::eq(&**c, self_child));
+            let index = parent.children.borrow().iter().position(|c| ptr::eq(&**c, self_child));
 
             if let Some(index) = index {
-                self.children.borrow_mut().remove(index);
-                //self.mark_layout_dirty();
+                parent.children.borrow_mut().remove(index);
+                parent.mark_needs_relayout();
             }
         }
     }
@@ -195,10 +232,12 @@ impl Element {
         self.transform.get()
     }
 
+    /// This should be called by `Visual::layout()` so this doesn't set the layout dirty flag.
     pub fn set_transform(&self, transform: Affine) {
         self.transform.set(transform);
     }
 
+    /// This should be called by `Visual::layout()` so this doesn't set the layout dirty flag.
     pub fn set_offset(&self, offset: Vec2) {
         self.set_transform(Affine::translate(offset));
     }
@@ -231,7 +270,6 @@ impl Element {
         ancestors
     }
 
-
     /// Returns this visual as a reference-counted pointer.
     pub fn rc(&self) -> Rc<dyn Visual + 'static> {
         self.weak_this.upgrade().unwrap()
@@ -242,6 +280,10 @@ impl Element {
         self.change_flags.set(flags);
         if let Some(parent) = self.parent() {
             parent.set_dirty_flags(flags);
+        }
+        if flags.contains(ChangeFlags::PAINT) {
+            // TODO: maybe don't call repaint for every widget in the hierarchy. winit should coalesce repaint requests, but still
+            self.window.borrow().request_repaint()
         }
     }
 
@@ -270,8 +312,6 @@ impl Element {
     }
 }
 
-
-
 /// Nodes in the visual tree.
 pub trait Visual: EventTarget {
     fn element(&self) -> &Element;
@@ -298,16 +338,20 @@ pub trait Visual: EventTarget {
         geometry
     }
 
-
     fn hit_test(&self, point: Point) -> bool {
         self.element().geometry.get().size.to_rect().contains(point)
     }
-
+    #[allow(unused_variables)]
     fn paint(&self, ctx: &mut PaintCtx) {}
 
     // Why async? this is because the visual may transfer control to async event handlers
     // before returning.
-    async fn event(&self, event: &mut Event) where Self: Sized {}
+    #[allow(unused_variables)]
+    async fn event(&self, event: &mut Event)
+    where
+        Self: Sized,
+    {
+    }
 }
 
 /// Implementation detail of `Visual` to get an object-safe version of `async fn event()`.
@@ -316,7 +360,9 @@ trait EventTarget {
 }
 
 impl<T> EventTarget for T
-where T: Visual {
+where
+    T: Visual,
+{
     fn event_future<'a>(&'a self, event: &'a mut Event) -> LocalBoxFuture<'a, ()> {
         self.event(event).boxed_local()
     }
@@ -348,7 +394,6 @@ impl<'a> Deref for dyn Visual + 'a {
 }
 
 impl dyn Visual + '_ {
-
     /// Returns the name of the visual.
     pub fn name(&self) -> String {
         self.element().name.borrow().clone()
@@ -358,7 +403,7 @@ impl dyn Visual + '_ {
         self.element().children()
     }
 
-    pub fn set_name(&self, name: impl Into<String>)  {
+    pub fn set_name(&self, name: impl Into<String>) {
         self.element().name.replace(name.into());
     }
 
@@ -376,14 +421,23 @@ impl dyn Visual + '_ {
 
     /// Sets the value of an attached property.
     pub fn set<T: AttachedProperty>(&self, value: T::Value) {
-        self.element().attached_properties.borrow_mut().insert(TypeId::of::<T>(), Box::new(value));
+        self.element()
+            .attached_properties
+            .borrow_mut()
+            .insert(TypeId::of::<T>(), Box::new(value));
     }
 
     /// Gets the value of an attached property.
     pub fn get<T: AttachedProperty>(&self) -> Option<T::Value> {
-        self.element().attached_properties.borrow().get(&TypeId::of::<T>()).map(|v| {
-            v.downcast_ref::<T::Value>().expect("invalid type of attached property").clone()
-        })
+        self.element()
+            .attached_properties
+            .borrow()
+            .get(&TypeId::of::<T>())
+            .map(|v| {
+                v.downcast_ref::<T::Value>()
+                    .expect("invalid type of attached property")
+                    .clone()
+            })
     }
 
     pub fn do_layout(&self, constraints: &BoxConstraints) -> Geometry {
@@ -393,7 +447,6 @@ impl dyn Visual + '_ {
         self.mark_layout_done();
         geometry
     }
-
 
     /// Iterates over the list of children of this visual.
     ///
@@ -443,7 +496,6 @@ impl dyn Visual + '_ {
         path
     }
 
-
     pub fn do_paint(&self, surface: &DrawableSurface, scale_factor: f64) {
         let mut paint_ctx = PaintCtx {
             scale_factor,
@@ -465,7 +517,6 @@ impl dyn Visual + '_ {
 
         paint_rec(self, &mut paint_ctx);
     }
-
 }
 
 /*
