@@ -71,6 +71,10 @@ fn main() {
         text_edit.set_text_style(TextStyle::default().font_family("Inter").font_size(50.0));
         text_edit.set_text("Hello, world!\nMultiline".to_string());
 
+        let text_edit2 = TextEdit::new();
+        text_edit2.set_text_style(TextStyle::default().font_family("Garamond").font_size(50.0));
+        text_edit2.set_text("Hello, world!\nMultiline".to_string());
+
         let value = 450;
 
         // FIXME: this doesn't work because the macro, like format_args, borrows temporaries
@@ -79,6 +83,7 @@ fn main() {
 
         frame.add_child(&Text::new(&text!( size(12.0) family("Inter") #EEE { "Hello," i "world!\n" b "This is bold" } "\nThis is a " { #F00 "red" } " word\n" "Value=" i "{value}" )));
         frame.add_child(&text_edit);
+        frame.add_child(&text_edit2);
         frame.add_child(&main_button);
 
         let window_options = WindowOptions {

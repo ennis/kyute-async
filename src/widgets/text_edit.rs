@@ -171,6 +171,8 @@ impl TextEdit {
             gesture: Cell::new(None),
         });
 
+        text_edit.set_tab_focusable(true);
+
         // spawn the caret blinker task
         let this_weak = Rc::downgrade(&text_edit);
         spawn(async move {
@@ -238,12 +240,15 @@ impl TextEdit {
     }
 
     /// Sets the current selection.
-    pub fn set_selection(&self, selection: Selection) {
+    pub fn set_selection(&self, selection: Selection) -> bool {
         // TODO clamp selection to text length
         let this = &mut *self.state.borrow_mut();
         if this.selection != selection {
             this.selection = selection;
             self.mark_needs_repaint();
+            true
+        } else {
+            false
         }
     }
 
@@ -505,7 +510,7 @@ impl Visual for TextEdit {
                     self.gesture.set(Some(Gesture::CharacterSelection));
                 }
                 self.reset_blink();
-                self.set_focus();
+                self.set_focus().await;
                 self.set_pointer_capture();
             }
             Event::PointerMove(event) => {
@@ -527,6 +532,14 @@ impl Visual for TextEdit {
             }
             Event::PointerUp(_event) => {
                 self.gesture.set(None);
+            }
+            Event::FocusGained => {
+                eprintln!("focus gained");
+                self.reset_blink();
+            }
+            Event::FocusLost => {
+                eprintln!("focus lost");
+                selection_changed |= self.set_selection(Selection::empty(0));
             }
             Event::KeyDown(event) => {
                 let keep_anchor = event.modifiers.shift();

@@ -26,8 +26,8 @@ use crate::app_globals::AppGlobals;
 use crate::application::{spawn, with_event_loop_window_target, WindowHandler};
 use crate::compositor::{ColorType, Layer};
 use crate::drawing::ToSkia;
-use crate::element::{AnyVisual, Element, Visual};
-use crate::event::{Event, key_event_to_key_code, PointerButton, PointerButtons, PointerEvent};
+use crate::element::{AnyVisual, Element, Visual, WeakNullableElemPtr};
+use crate::event::{key_event_to_key_code, Event, PointerButton, PointerButtons, PointerEvent};
 use crate::handler::Handler;
 use crate::layout::BoxConstraints;
 use crate::{application, Color, PaintCtx};
@@ -110,9 +110,9 @@ pub(crate) struct WindowInner {
     last_physical_size: Cell<Size>,
     input_state: RefCell<InputState>,
     /// The widget currently grabbing the pointer.
-    pointer_capture: RefCell<Option<AnyVisual>>,
+    pointer_capture: WeakNullableElemPtr,
     /// The widget that has the focus for keyboard events.
-    focus: RefCell<Option<AnyVisual>>,
+    focus: WeakNullableElemPtr,
     background: Cell<Color>,
     active_popup: RefCell<Option<Weak<WindowInner>>>,
     // DEBUGGING
@@ -120,29 +120,45 @@ pub(crate) struct WindowInner {
 }
 
 impl WindowInner {
-
     fn is_focused(&self, element: &Element) -> bool {
-        self.focus.borrow().as_ref().map(|f| f.element() as *const Element == element as *const Element).unwrap_or(false)
+        self.focus == *element
     }
-
-    /*fn focused(&self) -> Option<&Element> {
-        self.focus.borrow().map(|v| v.element())
-    }*/
 
     fn check_belongs_to_window(&self, element: &Element) {
-        assert!(Weak::ptr_eq(&element.window.borrow().shared, &self.weak_this), "element must belong to this window");
+        assert!(
+            Weak::ptr_eq(&element.window.borrow().shared, &self.weak_this),
+            "element must belong to this window"
+        );
     }
 
-    fn set_focus(&self, element: &Element) {
-        self.check_belongs_to_window(element);
-        eprintln!("set_focus {}", element.name());
-        self.focus.replace(Some(element.rc().into()));
+    async fn set_focus(&self, element: Option<&Element>) {
+        if let Some(element) = element {
+            self.check_belongs_to_window(element);
+            eprintln!("set_focus {}", element.name());
+        }
+
+        // Same element, do nothing
+        if self.focus == element {
+            return;
+        }
+
+        let prev = self.focus.replace(element.map(|e| e.weak()));
+
+        // send focus gained/lost events
+        if let Some(prev) = prev {
+            if let Some(prev) = prev.upgrade() {
+                self.dispatch_event(&*prev, &mut Event::FocusLost, false).await;
+            }
+        }
+        if let Some(new) = self.focus.upgrade() {
+            self.dispatch_event(&*new, &mut Event::FocusGained, false).await;
+        }
     }
 
     fn set_pointer_capture(&self, element: &Element) {
         self.check_belongs_to_window(element);
         eprintln!("set_pointer_capture {}", element.name());
-        self.pointer_capture.replace(Some(element.rc().into()));
+        self.pointer_capture.replace(Some(element.weak()));
     }
 
     /// Dispatches an event to a target visual in the UI tree.
@@ -150,7 +166,7 @@ impl WindowInner {
     /// It will first invoke the event handler of the target visual.
     /// If the event is "bubbling", it will invoke the event handler of the parent visual,
     /// and so on until the root visual is reached.
-    async fn dispatch_event(&self, target: &dyn Visual, mut event: Event, bubbling: bool) {
+    async fn dispatch_event(&self, target: &dyn Visual, event: &mut Event, bubbling: bool) {
         // get dispatch chain
         let chain = target.ancestors_and_self();
         assert!(
@@ -171,12 +187,12 @@ impl WindowInner {
             // dispatch the event, bubbling from the target up the root
             for (visual, transform) in chain.iter().rev().zip(transforms.iter().rev()) {
                 event.set_transform(transform);
-                visual.send_event(&mut event).await;
+                visual.send_event(event).await;
             }
         } else {
             // dispatch the event to the target only
             event.set_transform(transforms.last().unwrap());
-            target.send_event(&mut event).await;
+            target.send_event(event).await;
         }
 
         // handle repaint
@@ -187,13 +203,33 @@ impl WindowInner {
         //}
     }
 
-
     /// Dispatches a keyboard event in the UI tree.
     ///
     /// Currently, it just sends it to the focused element, or drops it if there's no focused element.
-    async fn dispatch_keyboard_event(&self, event: Event) {
-        if let Some(ref focus) = &*self.focus.borrow() {
-            self.dispatch_event(&**focus, event, true).await;
+    async fn dispatch_keyboard_event(&self, mut event: Event) {
+        if let Some(focus) = self.focus.upgrade() {
+            self.dispatch_event(&*focus, &mut event, true).await;
+        }
+
+        // TODO do this only if the event was not consumed
+
+        // Handle tab navigation
+        match event {
+            Event::KeyDown(ke) if ke.key == Key::Tab => {
+                if let Some(focus) = self.focus.upgrade() {
+                    // Go to next focusable element
+                    if let Some(next_focus) = focus.next_focusable_element() {
+                        self.set_focus(Some(&next_focus)).await;
+                    } else if let Some(next_focus) = self.root.next_focusable_element() {
+                        // cycle back to the first focusable element
+                        self.set_focus(Some(&next_focus)).await;
+                    } else {
+                        // no focusable elements
+                        self.set_focus(None).await;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -209,7 +245,7 @@ impl WindowInner {
     /// Returns true if the app logic should re-run in response of the event.
     async fn dispatch_pointer_event(
         &self,
-        event: Event,
+        mut event: Event,
         hit_position: Point,
         //time: Duration,
     ) {
@@ -221,10 +257,10 @@ impl WindowInner {
 
         // If something is grabbing the pointer, then the event is delivered to that element;
         // otherwise it is delivered to the innermost widget that passes the hit-test.
-        let target = self.pointer_capture.borrow().clone().or(innermost_hit.clone());
+        let target = self.pointer_capture.upgrade().or(innermost_hit.clone().map(|v| v.0));
 
         if let Some(target) = target {
-            self.dispatch_event(&*target, event, true).await;
+            self.dispatch_event(&*target, &mut event, true).await;
         }
 
         // release pointer capture automatically on pointer up
@@ -250,26 +286,26 @@ impl WindowInner {
         // send pointerout
         if hit_changed {
             if let Some(ref out) = input_state.last_innermost_hit {
-                self.dispatch_event(&**out, Event::PointerOut(p), true).await;
+                self.dispatch_event(&**out, &mut Event::PointerOut(p), true).await;
             }
         }
         // send pointerleave
         let leaving = input_state.last_hits.difference(&hits_set);
         for v in leaving {
-            self.dispatch_event(&**v, Event::PointerLeave(p), false).await;
+            self.dispatch_event(&**v, &mut Event::PointerLeave(p), false).await;
         }
 
         // send pointerover
         if hit_changed {
             if let Some(ref over) = innermost_hit {
-                self.dispatch_event(&**over, Event::PointerOver(p), true).await;
+                self.dispatch_event(&**over, &mut Event::PointerOver(p), true).await;
             }
         }
 
         // send pointerenter
         let entering = hits_set.difference(&input_state.last_hits);
         for v in entering {
-            self.dispatch_event(&**v, Event::PointerEnter(p), false).await;
+            self.dispatch_event(&**v, &mut Event::PointerEnter(p), false).await;
         }
 
         // update last hits
@@ -298,11 +334,6 @@ impl WindowInner {
             input_state.pointer_buttons.reset(button);
         }
         let click_time = Instant::now();
-
-        /*// implicit pointer ungrab
-        if !state.is_pressed() {
-            self.input_state.pointer_grab = None;
-        }*/
 
         // determine the repeat count (double-click, triple-click, etc.) for button down event
         let repeat_count = match &mut input_state.last_click {
@@ -361,7 +392,7 @@ impl WindowInner {
         let (key, code) = key_event_to_key_code(&key_event);
         // update modifiers
         match (&key, key_event.state) {
-            (Key::Shift, ElementState::Pressed) => input.modifiers.insert(keyboard_types::Modifiers::SHIFT,),
+            (Key::Shift, ElementState::Pressed) => input.modifiers.insert(keyboard_types::Modifiers::SHIFT),
             (Key::Shift, ElementState::Released) => input.modifiers.remove(keyboard_types::Modifiers::SHIFT),
             (Key::Control, ElementState::Pressed) => input.modifiers.insert(keyboard_types::Modifiers::CONTROL),
             (Key::Control, ElementState::Released) => input.modifiers.remove(keyboard_types::Modifiers::CONTROL),
@@ -372,35 +403,30 @@ impl WindowInner {
             _ => {}
         }
 
-        let ke =
-            KeyboardEvent {
-                state: match key_event.state {
-                    ElementState::Pressed => keyboard_types::KeyState::Down,
-                    ElementState::Released => keyboard_types::KeyState::Up,
-                },
-                key,
-                code,
-                location: match key_event.location {
-                    KeyLocation::Standard => keyboard_types::Location::Standard,
-                    KeyLocation::Left => keyboard_types::Location::Left,
-                    KeyLocation::Right => keyboard_types::Location::Right,
-                    KeyLocation::Numpad => keyboard_types::Location::Numpad,
-                },
-                modifiers: input.modifiers,
-                repeat: key_event.repeat,
-                is_composing: false,
-            };
+        let ke = KeyboardEvent {
+            state: match key_event.state {
+                ElementState::Pressed => keyboard_types::KeyState::Down,
+                ElementState::Released => keyboard_types::KeyState::Up,
+            },
+            key,
+            code,
+            location: match key_event.location {
+                KeyLocation::Standard => keyboard_types::Location::Standard,
+                KeyLocation::Left => keyboard_types::Location::Left,
+                KeyLocation::Right => keyboard_types::Location::Right,
+                KeyLocation::Numpad => keyboard_types::Location::Numpad,
+            },
+            modifiers: input.modifiers,
+            repeat: key_event.repeat,
+            is_composing: false,
+        };
 
         self.last_kb_event.replace(Some(ke.clone()));
         //eprintln!("[{:?}] key={:?}, code={:?}, modifiers={:?}", self.window.id(), key, code, input.modifiers);
 
         match ke.state {
-            keyboard_types::KeyState::Down => {
-                Event::KeyDown(ke)
-            }
-            keyboard_types::KeyState::Up => {
-                Event::KeyUp(ke)
-            }
+            keyboard_types::KeyState::Down => Event::KeyDown(ke),
+            keyboard_types::KeyState::Up => Event::KeyUp(ke),
         }
     }
 
@@ -648,9 +674,9 @@ impl WeakWindow {
         }
     }
 
-    pub fn set_focus(&self, element: &Element) {
+    pub async fn set_focus(&self, element: Option<&Element>) {
         if let Some(shared) = self.shared.upgrade() {
-            shared.set_focus(element);
+            shared.set_focus(element).await;
         }
     }
 
@@ -662,7 +688,10 @@ impl WeakWindow {
 
     /// Returns a reference to the currently focused element.
     pub fn is_focused(&self, element: &Element) -> bool {
-        self.shared.upgrade().map(|shared| shared.is_focused(element)).unwrap_or(false)
+        self.shared
+            .upgrade()
+            .map(|shared| shared.is_focused(element))
+            .unwrap_or(false)
     }
 }
 
@@ -746,8 +775,8 @@ impl Window {
             cursor_pos: Cell::new(Default::default()),
             last_physical_size: Cell::new(phy_size),
             input_state: Default::default(),
-            pointer_capture: RefCell::new(None),
-            focus: RefCell::new(None),
+            pointer_capture: Default::default(),
+            focus: Default::default(),
             background: Cell::new(options.background),
             active_popup: RefCell::new(None),
             last_kb_event: RefCell::new(None),
@@ -765,8 +794,8 @@ impl Window {
         Window { shared }
     }
 
-    pub fn set_focus(&self, element: &Element) {
-        self.shared.set_focus(element);
+    pub async fn set_focus(&self, element: Option<&Element>) {
+        self.shared.set_focus(element).await;
     }
 
     pub fn as_weak(&self) -> WeakWindow {

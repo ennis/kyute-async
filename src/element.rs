@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::marker::PhantomPinned;
 use std::ops::Deref;
-use std::ptr;
+use std::{mem, ptr};
 use std::ptr::addr_eq;
 use std::rc::{Rc, Weak};
 
@@ -89,7 +89,7 @@ impl PartialEq for AnyVisual {
 type RcVisual = Rc<dyn Visual>;
 type WeakVisual = Weak<dyn Visual>;
 
-struct NullableElemPtr(UnsafeCell<Option<Rc<dyn Visual>>>);
+pub(crate) struct NullableElemPtr(UnsafeCell<Option<Rc<dyn Visual>>>);
 
 impl Default for NullableElemPtr {
     fn default() -> Self {
@@ -116,7 +116,38 @@ impl<'a> From<&'a Element> for NullableElemPtr {
     }
 }
 
-struct WeakNullableElemPtr(UnsafeCell<Option<Weak<dyn Visual>>>);
+pub(crate) struct WeakNullableElemPtr(UnsafeCell<Option<Weak<dyn Visual>>>);
+
+impl<'a> PartialEq<Option<&'a Element>> for WeakNullableElemPtr {
+    fn eq(&self, other: &Option<&'a Element>) -> bool {
+        let this = unsafe { &* self.0.get()}.as_ref();
+        let other = other.map(|e| &e.weak_this);
+        match (this, other) {
+            (Some(this), Some(other)) => Weak::ptr_eq(this, other),
+            (None, None) => true,
+            _ => false
+        }
+    }
+}
+
+impl PartialEq<Element> for WeakNullableElemPtr {
+    fn eq(&self, other: &Element) -> bool {
+        let this = unsafe { &* self.0.get()}.as_ref();
+        let other = &other.weak_this;
+        if let Some(this) = this {
+            Weak::ptr_eq(this, other)
+        } else {
+            false
+        }
+    }
+}
+
+/*
+impl PartialEq<Option<Weak<dyn Visual>>> for WeakNullableElemPtr {
+    fn eq(&self, other: &Option<Weak<dyn Visual>>) -> bool {
+        self.get().as_ref().map(|w| Weak::ptr_eq(w, other)).unwrap_or(false)
+    }
+}*/
 
 impl Default for WeakNullableElemPtr {
     fn default() -> Self {
@@ -126,12 +157,18 @@ impl Default for WeakNullableElemPtr {
 
 impl WeakNullableElemPtr {
     pub fn get(&self) -> Option<Weak<dyn Visual>> {
-        unsafe { &*self.0.get() }.as_ref().cloned()
+        unsafe { &*self.0.get() }.clone()
     }
 
     pub fn set(&self, other: Option<Weak<dyn Visual>>) {
         unsafe {
             *self.0.get() = other;
+        }
+    }
+
+    pub fn replace(&self, other: Option<Weak<dyn Visual>>) -> Option<Weak<dyn Visual>> {
+        unsafe {
+            mem::replace(&mut *self.0.get(), other)
         }
     }
 
@@ -163,26 +200,29 @@ impl Iterator for Cursor {
     type Item = Rc<dyn Visual>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let r = self.next.clone();
-        if let Some(ref r) = self.next {
-            if let Some(first_child) = r.first_child.get() {
-                self.next = Some(first_child);
-            } else if let Some(next) = r.next.get() {
-                self.next = Some(next);
-            } else {
-                // go up until we find a parent with a next sibling
 
-                let mut parent = r.parent();
-                while let Some(p) = parent {
-                    if let Some(next) = p.next.get() {
-                        self.next = Some(next);
-                        break;
-                    }
-                    parent = p.parent();
+        let Some(next) = self.next.clone() else {
+            return None;
+        };
+
+        if let Some(first_child) = next.first_child.get() {
+            self.next = Some(first_child);
+        } else if let Some(next) = next.next.get() {
+            self.next = Some(next);
+        } else {
+            // go up until we find a parent with a next sibling
+            let mut parent = next.parent();
+            self.next = None;
+            while let Some(p) = parent {
+                if let Some(next) = p.next.get() {
+                    self.next = Some(next);
+                    break;
                 }
+                parent = p.parent();
             }
         }
-        r
+
+        Some(next)
     }
 }
 
@@ -213,8 +253,8 @@ pub struct Element {
     //children: RefCell<Vec<AnyVisual>>,
     /// Name of the element.
     name: RefCell<String>,
-    /// Whether the element is tab-focusable.
-    tab_focusable: Cell<bool>,
+    /// Whether the element is focusable via tab-navigation.
+    focusable: Cell<bool>,
 
     attached_properties: RefCell<BTreeMap<TypeId, Box<dyn Any>>>,
     // self-referential
@@ -243,7 +283,7 @@ impl Element {
             geometry: Cell::new(Geometry::default()),
             change_flags: Cell::new(ChangeFlags::LAYOUT | ChangeFlags::PAINT),
             name: RefCell::new(format!("{:p}", weak_this.as_ptr())),
-            tab_focusable: Cell::new(false),
+            focusable: Cell::new(false),
             attached_properties: Default::default(),
         }
     }
@@ -349,28 +389,15 @@ impl Element {
         })
     }
 
-    /// Finds the next element in the tab chain.
-    pub fn tab_next(&self) -> Option<&Element> {
-        /*//let parent = self.parent();
-
-        // FIXME: this is a hack, ideally we'd be able to query siblings
-        let index = self.index_in_children();
-        if let Some(parent) = self.parent() {
-            let children = parent.children.borrow();
-
-            for child in &children[index..] {
-                if child.tab_focusable.get() {
-                    return Some(&**child);
-                }
+    /// Returns the next focusable element.
+    pub fn next_focusable_element(&self) -> Option<Rc<dyn Visual>> {
+        let mut cursor = self.cursor();
+        cursor.next();      // skip self
+        while let Some(node) = cursor.next() {
+            if node.focusable.get() {
+                return Some(node);
             }
-
-            parent.tab_next()
-        } else {
-            None
         }
-
-         */
-        // TODO
         None
     }
 
@@ -382,12 +409,12 @@ impl Element {
     }
 
     /// Requests focus for the current element.
-    pub fn set_focus(&self) {
-        self.window.borrow().set_focus(self);
+    pub async fn set_focus(&self) {
+        self.window.borrow().set_focus(Some(self)).await;
     }
 
     pub fn set_tab_focusable(&self, focusable: bool) {
-        self.tab_focusable.set(focusable);
+        self.focusable.set(focusable);
     }
 
     pub fn set_pointer_capture(&self) {
