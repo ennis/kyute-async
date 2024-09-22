@@ -7,14 +7,14 @@ use crate::layout::{BoxConstraints, Geometry};
 use crate::text::{FormattedText, Selection, TextStyle};
 use crate::{application, text, Color, PaintCtx};
 use futures_util::future::AbortHandle;
+use keyboard_types::Key;
 use kurbo::{Point, Rect, Size};
 use skia_safe::textlayout::{RectHeightStyle, RectWidthStyle};
 use std::cell::{Cell, RefCell};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use keyboard_types::Key;
 use tracing::warn;
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
@@ -36,6 +36,17 @@ fn next_grapheme_cluster(text: &str, offset: usize) -> Option<usize> {
     c.next_boundary(text, 0).unwrap()
 }
 
+/// If `other` comes before `self`, the cursor is placed at the beginning of the selection.
+fn add_selections(this: Selection, other: Selection) -> Selection {
+    let min = this.min().min(other.min());
+    let max = this.max().max(other.max());
+    if other.min() < this.min() {
+        Selection { start: max, end: min }
+    } else {
+        Selection { start: min, end: max }
+    }
+}
+
 struct TextEditState {
     text: String,
     selection: Selection,
@@ -52,16 +63,6 @@ impl TextEditState {
         let text = self.text.clone();
         self.paragraph = FormattedText::new(text!( style(self.text_style) "{text}")).inner;
     }
-}
-
-/// Single- or multiline text editor.
-pub struct TextEdit {
-    element: Element,
-    selection_changed: Handler<Selection>,
-    state: RefCell<TextEditState>,
-    in_gesture: Cell<bool>,
-    blink_phase: Cell<bool>,
-    blink_reset: Cell<bool>,
 }
 
 const CARET_BLINK_INITIAL_DELAY: Duration = Duration::from_secs(1);
@@ -133,6 +134,23 @@ fn prev_word_boundary(text: &str, offset: usize) -> usize {
     pos
 }
 
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Gesture {
+    CharacterSelection,
+    WordSelection { anchor: Selection },
+}
+
+/// Single- or multiline text editor.
+pub struct TextEdit {
+    element: Element,
+    selection_changed: Handler<Selection>,
+    state: RefCell<TextEditState>,
+    gesture: Cell<Option<Gesture>>,
+    blink_phase: Cell<bool>,
+    blink_reset: Cell<bool>,
+}
+
 impl TextEdit {
     pub fn new() -> Rc<TextEdit> {
         let text_edit = Element::new_derived(|element| TextEdit {
@@ -148,9 +166,9 @@ impl TextEdit {
                 caret_color: Color::from_rgba_u8(255, 255, 0, 255),
                 relayout: true,
             }),
-            in_gesture: Cell::new(false),
             blink_phase: Cell::new(true),
             blink_reset: Cell::new(false),
+            gesture: Cell::new(None),
         });
 
         // spawn the caret blinker task
@@ -245,6 +263,13 @@ impl TextEdit {
         self.mark_needs_relayout();
     }
 
+    pub fn get_text_offset_at_point(&self, point: Point) -> usize {
+        let this = &mut *self.state.borrow_mut();
+        this.paragraph
+            .get_glyph_position_at_coordinate(point.to_skia())
+            .position as usize
+    }
+
     /// NOTE: valid only after first layout.
     pub fn set_cursor_at_point(&self, point: Point, keep_anchor: bool) -> bool {
         // TODO set cursor position based on point
@@ -273,6 +298,24 @@ impl TextEdit {
             end: range.end,
         };
         self.mark_needs_repaint();
+    }
+
+    pub fn select_word_at_offset_with_anchor(&self, offset: usize, anchor_selection: Selection) -> bool {
+        let this = &mut *self.state.borrow_mut();
+        let range = this.paragraph.get_word_boundary(offset as u32);
+        let word = Selection {
+            start: range.start,
+            end: range.end,
+        };
+        let new_selection = add_selections(anchor_selection, word);
+        if new_selection != this.selection {
+            this.selection = new_selection;
+            self.mark_needs_repaint();
+            true
+        } else {
+            false
+        }
+
     }
 
     /// Moves the cursor to the next or previous word boundary.
@@ -376,7 +419,7 @@ impl Visual for TextEdit {
         &self.element
     }
 
-    fn layout(&self, _children: &[AnyVisual], constraints: &BoxConstraints) -> Geometry {
+    fn layout(&self, _children: &[Rc<dyn Visual>], constraints: &BoxConstraints) -> Geometry {
         let this = &mut *self.state.borrow_mut();
 
         // determine the available space for layout
@@ -431,12 +474,11 @@ impl Visual for TextEdit {
                         Point::new((info.bounds.left as f64).round(), (info.bounds.top as f64).round()),
                         Size::new(1.0, info.bounds.height() as f64),
                     );
-                    eprintln!("caret_rect: {:?}", caret_rect);
+                    //eprintln!("caret_rect: {:?}", caret_rect);
                     let caret_paint = Paint::from(this.caret_color).to_sk_paint(bounds.to_rect());
                     canvas.draw_rect(caret_rect.to_skia(), &caret_paint);
                 }
             }
-
         });
     }
 
@@ -448,34 +490,43 @@ impl Visual for TextEdit {
         match event {
             Event::PointerDown(event) => {
                 let pos = event.local_position();
-                eprintln!("pointer down point: {:?}", pos);
+                eprintln!("[text_edit] pointer down: {:?}", pos);
                 if event.repeat_count == 2 {
                     // select word under cursor
                     self.select_word_under_cursor();
                     selection_changed = true;
+                    self.gesture.set(Some(Gesture::WordSelection {
+                        anchor: self.selection(),
+                    }));
                 } else if event.repeat_count == 3 {
-                    // select line under cursor
+                    // TODO select line under cursor
                 } else {
                     selection_changed |= self.set_cursor_at_point(pos, false);
+                    self.gesture.set(Some(Gesture::CharacterSelection));
                 }
                 self.reset_blink();
                 self.set_focus();
-                self.in_gesture.set(true);
+                self.set_pointer_capture();
             }
             Event::PointerMove(event) => {
+                //eprintln!("pointer move point: {:?}", event.local_position());
                 let pos = event.local_position();
-                if self.in_gesture.get() {
-                    selection_changed |= self.set_cursor_at_point(pos, true);
+
+                match self.gesture.get() {
+                    Some(Gesture::CharacterSelection) => {
+                        selection_changed |= self.set_cursor_at_point(pos, true);
+                    }
+                    Some(Gesture::WordSelection { anchor }) => {
+                        let text_offset = self.get_text_offset_at_point(pos);
+                        selection_changed |=  self.select_word_at_offset_with_anchor(text_offset, anchor);
+                    }
+                    _ => {}
                 }
+
                 self.reset_blink();
             }
-            Event::PointerUp(event) => {
-                // TODO set selection based on pointer position
-                let pos = event.local_position();
-                if self.in_gesture.get() {
-                    selection_changed |= self.set_cursor_at_point(pos, true);
-                    self.in_gesture.set(false);
-                }
+            Event::PointerUp(_event) => {
+                self.gesture.set(None);
             }
             Event::KeyDown(event) => {
                 let keep_anchor = event.modifiers.shift();

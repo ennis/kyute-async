@@ -208,7 +208,7 @@ pub struct FlexLayoutParams {
 // Conforming to CSS:
 // - flex layout gets either a size or `auto`
 
-pub fn do_flex_layout(p: &FlexLayoutParams, children: &[AnyVisual]) -> Geometry {
+pub fn do_flex_layout(p: &FlexLayoutParams, children: &[Rc<dyn Visual>]) -> Geometry {
     let axis = p.axis;
     let (main_axis_min, main_axis_max, mut cross_axis_min, cross_axis_max) = if axis == Axis::Horizontal {
         (
@@ -235,7 +235,7 @@ pub fn do_flex_layout(p: &FlexLayoutParams, children: &[AnyVisual]) -> Geometry 
 
     let mut flex_factors = Vec::with_capacity(child_count);
     for child in children.iter() {
-        if let Some(flex) = FlexFactor.get(&*child.0) {
+        if let Some(flex) = FlexFactor.get(&**child) {
             flex_factors.push(flex);
         } else {
             flex_factors.push(0.0);

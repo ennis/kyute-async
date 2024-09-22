@@ -1,5 +1,5 @@
 use std::any::{Any, TypeId};
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell, UnsafeCell};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::marker::PhantomPinned;
@@ -86,27 +86,135 @@ impl PartialEq for AnyVisual {
     }
 }
 
+type RcVisual = Rc<dyn Visual>;
+type WeakVisual = Weak<dyn Visual>;
+
+struct NullableElemPtr(UnsafeCell<Option<Rc<dyn Visual>>>);
+
+impl Default for NullableElemPtr {
+    fn default() -> Self {
+        NullableElemPtr(UnsafeCell::new(None))
+    }
+}
+
+impl NullableElemPtr {
+
+    pub fn get(&self) -> Option<Rc<dyn Visual>> {
+        unsafe { &*self.0.get() }.as_ref().cloned()
+    }
+
+    pub fn set(&self, other: Option<Rc<dyn Visual>>) {
+        unsafe {
+            *self.0.get() = other;
+        }
+    }
+}
+
+impl<'a> From<&'a Element> for NullableElemPtr {
+    fn from(element: &'a Element) -> Self {
+        NullableElemPtr(UnsafeCell::new(Some(element.rc())))
+    }
+}
+
+struct WeakNullableElemPtr(UnsafeCell<Option<Weak<dyn Visual>>>);
+
+impl Default for WeakNullableElemPtr {
+    fn default() -> Self {
+        WeakNullableElemPtr(UnsafeCell::new(None))
+    }
+}
+
+impl WeakNullableElemPtr {
+    pub fn get(&self) -> Option<Weak<dyn Visual>> {
+        unsafe { &*self.0.get() }.as_ref().cloned()
+    }
+
+    pub fn set(&self, other: Option<Weak<dyn Visual>>) {
+        unsafe {
+            *self.0.get() = other;
+        }
+    }
+
+    pub fn upgrade(&self) -> Option<Rc<dyn Visual>> {
+        self.get().as_ref().and_then(Weak::upgrade)
+    }
+}
+
+pub struct SiblingIter {
+    next: Option<Rc<dyn Visual>>
+}
+
+impl Iterator for SiblingIter {
+    type Item = Rc<dyn Visual>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let r = self.next.clone();
+        self.next = self.next.as_ref().and_then(|n| n.next.get());
+        r
+    }
+}
+
+/// Depth-first traversal of the visual tree.
+pub struct Cursor {
+    next: Option<Rc<dyn Visual>>
+}
+
+impl Iterator for Cursor {
+    type Item = Rc<dyn Visual>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let r = self.next.clone();
+        if let Some(ref r) = self.next {
+            if let Some(first_child) = r.first_child.get() {
+                self.next = Some(first_child);
+            } else if let Some(next) = r.next.get() {
+                self.next = Some(next);
+            } else {
+                // go up until we find a parent with a next sibling
+
+                let mut parent = r.parent();
+                while let Some(p) = parent {
+                    if let Some(next) = p.next.get() {
+                        self.next = Some(next);
+                        break;
+                    }
+                    parent = p.parent();
+                }
+            }
+        }
+        r
+    }
+}
+
 /// Base state of an element.
 pub struct Element {
     _pin: PhantomPinned,
     /// Weak pointer to this element.
     weak_this: Weak<dyn Visual>,
+
+    prev: WeakNullableElemPtr,
+    next: NullableElemPtr,
+    first_child: NullableElemPtr,
+    last_child: WeakNullableElemPtr,
+
     /// Pointer to the parent owner window.
     pub(crate) window: RefCell<WeakWindow>,
     /// TODO unused
     key: Cell<usize>,
     /// This element's parent.
-    parent: RefCell<Option<Weak<dyn Visual>>>,
+    parent: WeakNullableElemPtr,
     /// Layout: transform from local to parent coordinates.
     transform: Cell<kurbo::Affine>,
     /// Layout: geometry (size and baseline) of this element.
     geometry: Cell<Geometry>,
     /// TODO unused
     change_flags: Cell<ChangeFlags>,
-    /// List of child elements.
-    children: RefCell<Vec<AnyVisual>>,
+    // List of child elements.
+    //children: RefCell<Vec<AnyVisual>>,
     /// Name of the element.
     name: RefCell<String>,
+    /// Whether the element is tab-focusable.
+    tab_focusable: Cell<bool>,
 
     attached_properties: RefCell<BTreeMap<TypeId, Box<dyn Any>>>,
     // self-referential
@@ -124,23 +232,109 @@ impl Element {
         Element {
             _pin: PhantomPinned,
             weak_this: weak_this.clone(),
+            prev: Default::default(),
+            next: Default::default(),
+            first_child: Default::default(),
+            last_child: Default::default(),
             window: Default::default(),
             key: Cell::new(0),
-            parent: RefCell::new(None),
+            parent: Default::default(),
             transform: Cell::new(kurbo::Affine::default()),
             geometry: Cell::new(Geometry::default()),
             change_flags: Cell::new(ChangeFlags::LAYOUT | ChangeFlags::PAINT),
-            children: RefCell::new(Vec::new()),
             name: RefCell::new(format!("{:p}", weak_this.as_ptr())),
+            tab_focusable: Cell::new(false),
             attached_properties: Default::default(),
         }
+    }
+
+
+    /// Detaches this element from the tree.
+    pub fn detach(&self) {
+        // this.prev.next = this.next
+        // OR this.parent.first_child = this.next
+        if let Some(prev) = self.prev.upgrade() {
+            prev.next.set(self.next.get());
+        } else if let Some(parent) = self.parent() {
+            parent.first_child.set(self.next.get());
+        }
+
+        // this.next.prev = this.prev
+        // OR this.parent.last_child = this.prev
+        if let Some(next) = self.next.get() {
+            next.prev.set(self.prev.get());
+        } else if let Some(parent) = self.parent() {
+            parent.last_child.set(self.prev.get());
+        }
+
+        self.prev.set(None);
+        self.next.set(None);
+
+        if let Some(parent) = self.parent() {
+            parent.mark_needs_relayout();
+        }
+
+        self.parent.set(None);
+    }
+
+    /// Inserts the specified element after this element.
+    pub fn insert_after(&self, to_insert: &Element) {
+        to_insert.detach();
+        // ins.prev = this
+        to_insert.prev.set(Some(self.weak()));
+        // ins.next = this.next
+        to_insert.next.set(self.next.get());
+        // this.next.prev = ins
+        // OR this.parent.last_child = ins
+        if let Some(next) = self.next.get() {
+            next.prev.set(Some(to_insert.weak()));
+        } else if let Some(parent) = self.parent() {
+            parent.last_child.set(Some(to_insert.weak()));
+        }
+        // this.next = ins
+        self.next.set(Some(to_insert.rc()));
+        // ins.parent = this.parent
+        to_insert.parent.set(self.parent.get());
+
+        if let Some(parent) = self.parent() {
+            parent.mark_needs_relayout();
+        }
+    }
+
+    /// Returns a cursor at this element
+    pub fn cursor(&self) -> Cursor {
+        Cursor {
+            next: Some(self.rc())
+        }
+    }
+
+    /// Inserts the specified element at the end of the children of this element.
+    pub fn add_child(&self, child: &Element) {
+        child.detach();
+
+        // child.prev = this.last_child
+        // child.next = None
+        // this.last_child.next = child
+        // this.last_child = child
+        // child.parent = this
+
+        child.prev.set(self.last_child.get());
+        child.next.set(None);
+        if let Some(last_child) = self.last_child.upgrade() {
+            last_child.next.set(Some(child.rc()));
+        } else {
+            self.first_child.set(Some(child.rc()));
+        }
+        self.last_child.set(Some(child.weak()));
+        child.parent.set(Some(self.weak()));
+        self.mark_needs_relayout()
     }
 
     pub(crate) fn set_parent_window(&self, window: WeakWindow) {
         if !Weak::ptr_eq(&self.window.borrow().shared, &window.shared) {
             self.window.replace(window.clone());
             // recursively update the parent window of the children
-            for child in self.children.borrow().iter() {
+            for child in self.iter_children() {
                 child.set_parent_window(window.clone());
             }
         }
@@ -155,14 +349,54 @@ impl Element {
         })
     }
 
+    /// Finds the next element in the tab chain.
+    pub fn tab_next(&self) -> Option<&Element> {
+        /*//let parent = self.parent();
+
+        // FIXME: this is a hack, ideally we'd be able to query siblings
+        let index = self.index_in_children();
+        if let Some(parent) = self.parent() {
+            let children = parent.children.borrow();
+
+            for child in &children[index..] {
+                if child.tab_focusable.get() {
+                    return Some(&**child);
+                }
+            }
+
+            parent.tab_next()
+        } else {
+            None
+        }
+
+         */
+        // TODO
+        None
+    }
+
+    /// Returns an iterator over this element's children.
+    pub fn iter_children(&self) -> impl Iterator<Item = Rc<dyn Visual>> {
+        SiblingIter {
+            next: self.first_child.get()
+        }
+    }
+
     /// Requests focus for the current element.
     pub fn set_focus(&self) {
         self.window.borrow().set_focus(self);
     }
 
-    pub fn children(&self) -> Ref<[AnyVisual]> {
-        Ref::map(self.children.borrow(), |v| v.as_slice())
+    pub fn set_tab_focusable(&self, focusable: bool) {
+        self.tab_focusable.set(focusable);
     }
+
+    pub fn set_pointer_capture(&self) {
+        self.window.borrow().set_pointer_capture(self);
+    }
+
+    /*pub fn children(&self) -> Ref<[AnyVisual]> {
+        Ref::map(self.children.borrow(), |v| v.as_slice())
+    }*/
 
     pub fn geometry(&self) -> Geometry {
         self.geometry.get()
@@ -179,7 +413,7 @@ impl Element {
             .is_focused(self)
     }
 
-    /// Adds a child visual and sets its parent to this visual.
+    /*/// Adds a child visual and sets its parent to this visual.
     // NOTE: pass `&Element` instead of `&dyn Visual` because deref-coercions seem to be more reliable
     // than unsized coercions to `&dyn Visual`.
     pub fn add_child(&self, child: &Element) {
@@ -188,15 +422,22 @@ impl Element {
         child.set_parent_window(self.window.borrow().clone());
         self.children.borrow_mut().push(child.rc().into());
         self.mark_needs_relayout();
-    }
+    }*/
 
     /// Removes all child visuals.
     pub fn clear_children(&self) {
-        self.children.borrow_mut().clear();
-        self.mark_needs_relayout();
+        for c in self.iter_children() {
+            // TODO: don't do that if there's only one reference remaining
+            // detach from window
+            c.window.replace(WeakWindow::default());
+            // detach from parent
+            c.parent.set(None);
+        }
+        self.first_child.set(None);
+        self.last_child.set(None);
     }
 
-    /// Removes the specified visual from the children of this visual.
+    /*/// Removes the specified visual from the children of this visual.
     ///
     // We could take a `&Element` instead of `&dyn Visual` if that's more convenient for the user.
     pub fn remove_child(&self, child: &dyn Visual) {
@@ -205,14 +446,14 @@ impl Element {
             self.children.borrow_mut().remove(index);
             self.mark_needs_relayout();
         }
-    }
+    }*/
 
     /// Returns the parent of this visual, if it has one.
     pub fn parent(&self) -> Option<Rc<dyn Visual>> {
-        self.parent.borrow().as_ref().and_then(Weak::upgrade)
+        self.parent.upgrade()
     }
 
-    /// Removes this visual from its parent.
+    /*/// Removes this visual from its parent.
     pub fn remove(&self) {
         if let Some(parent) = self.parent() {
             let self_child = self.weak_this.as_ptr();
@@ -223,7 +464,7 @@ impl Element {
                 parent.mark_needs_relayout();
             }
         }
-    }
+    }*/
 
     /// Returns the transform of this visual relative to its parent.
     ///
@@ -275,6 +516,16 @@ impl Element {
         self.weak_this.upgrade().unwrap()
     }
 
+    pub fn weak(&self) -> Weak<dyn Visual + 'static> {
+        self.weak_this.clone()
+    }
+
+    /// Returns the list of children.
+    pub fn children(&self) -> Vec<Rc<dyn Visual + 'static>> {
+        // traverse the linked list
+        self.iter_children().collect()
+    }
+
     fn set_dirty_flags(&self, flags: ChangeFlags) {
         let flags = self.change_flags.get() | flags;
         self.change_flags.set(flags);
@@ -324,7 +575,8 @@ pub trait Visual: EventTarget {
         }
     }
 
-    fn layout(&self, children: &[AnyVisual], constraints: &BoxConstraints) -> Geometry {
+    // TODO: this could take a "SiblingIter"
+    fn layout(&self, children: &[Rc<dyn Visual>], constraints: &BoxConstraints) -> Geometry {
         // The default implementation just returns the union of the geometry of the children.
         let mut geometry = Geometry::default();
         for child in children {
@@ -394,14 +646,10 @@ impl<'a> Deref for dyn Visual + 'a {
 }
 
 impl dyn Visual + '_ {
-    /// Returns the name of the visual.
-    pub fn name(&self) -> String {
-        self.element().name.borrow().clone()
-    }
 
-    pub fn children(&self) -> Ref<[AnyVisual]> {
+    /*pub fn children(&self) -> Ref<[AnyVisual]> {
         self.element().children()
-    }
+    }*/
 
     pub fn set_name(&self, name: impl Into<String>) {
         self.element().name.replace(name.into());
@@ -414,10 +662,10 @@ impl dyn Visual + '_ {
         addr_eq(self, other)
     }
 
-    /// Returns the number of children of this visual.
+    /*/// Returns the number of children of this visual.
     pub fn child_count(&self) -> usize {
         self.element().children.borrow().len()
-    }
+    }*/
 
     /// Sets the value of an attached property.
     pub fn set<T: AttachedProperty>(&self, value: T::Value) {
@@ -442,6 +690,7 @@ impl dyn Visual + '_ {
 
     pub fn do_layout(&self, constraints: &BoxConstraints) -> Geometry {
         let children = self.children();
+
         let geometry = self.layout(&*children, constraints);
         self.geometry.set(geometry);
         self.mark_layout_done();
@@ -452,9 +701,8 @@ impl dyn Visual + '_ {
     ///
     /// Stops iterating if the closure returns `false`.
     pub fn traverse_children(&self, mut f: impl FnMut(&dyn Visual) -> bool) {
-        let children = self.children.borrow();
-        for child in children.iter() {
-            if !f(&**child) {
+        for child in self.iter_children() {
+            if !f(&*child) {
                 break;
             }
         }
@@ -506,10 +754,10 @@ impl dyn Visual + '_ {
         // Recursively paint the UI tree.
         fn paint_rec(visual: &dyn Visual, ctx: &mut PaintCtx) {
             visual.paint(ctx);
-            for child in visual.children().iter() {
+            for child in visual.iter_children() {
                 ctx.with_transform(&child.transform(), |ctx| {
                     // TODO clipping
-                    paint_rec(&**child, ctx);
+                    paint_rec(&*child, ctx);
                     child.mark_paint_done();
                 });
             }

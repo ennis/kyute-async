@@ -40,7 +40,7 @@ impl<D: Decoration + 'static> Visual for DecoratedBox<D> {
         &self.element
     }
 
-    fn layout(&self, children: &[AnyVisual], constraints: &BoxConstraints) -> Geometry {
+    fn layout(&self, children: &[Rc<dyn Visual>], constraints: &BoxConstraints) -> Geometry {
         // stack children
         for child in children {
             child.do_layout(constraints);

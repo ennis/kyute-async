@@ -26,7 +26,7 @@ use crate::app_globals::AppGlobals;
 use crate::application::{spawn, with_event_loop_window_target, WindowHandler};
 use crate::compositor::{ColorType, Layer};
 use crate::drawing::ToSkia;
-use crate::element::{AnyVisual, Element, HitTestEntry, Visual};
+use crate::element::{AnyVisual, Element, Visual};
 use crate::event::{Event, key_event_to_key_code, PointerButton, PointerButtons, PointerEvent};
 use crate::handler::Handler;
 use crate::layout::BoxConstraints;
@@ -110,7 +110,7 @@ pub(crate) struct WindowInner {
     last_physical_size: Cell<Size>,
     input_state: RefCell<InputState>,
     /// The widget currently grabbing the pointer.
-    pointer_grab: RefCell<Option<AnyVisual>>,
+    pointer_capture: RefCell<Option<AnyVisual>>,
     /// The widget that has the focus for keyboard events.
     focus: RefCell<Option<AnyVisual>>,
     background: Cell<Color>,
@@ -129,10 +129,20 @@ impl WindowInner {
         self.focus.borrow().map(|v| v.element())
     }*/
 
-    fn set_focus(&self, element: &Element) {
+    fn check_belongs_to_window(&self, element: &Element) {
         assert!(Weak::ptr_eq(&element.window.borrow().shared, &self.weak_this), "element must belong to this window");
-        eprintln!("set focus element {}", element.name());
+    }
+
+    fn set_focus(&self, element: &Element) {
+        self.check_belongs_to_window(element);
+        eprintln!("set_focus {}", element.name());
         self.focus.replace(Some(element.rc().into()));
+    }
+
+    fn set_pointer_capture(&self, element: &Element) {
+        self.check_belongs_to_window(element);
+        eprintln!("set_pointer_capture {}", element.name());
+        self.pointer_capture.replace(Some(element.rc().into()));
     }
 
     /// Dispatches an event to a target visual in the UI tree.
@@ -207,13 +217,19 @@ impl WindowInner {
 
         let hits = self.root.do_hit_test(hit_position);
         let innermost_hit = hits.last().cloned();
+        let is_pointer_up = matches!(event, Event::PointerUp(_));
 
         // If something is grabbing the pointer, then the event is delivered to that element;
         // otherwise it is delivered to the innermost widget that passes the hit-test.
-        let target = self.pointer_grab.take().or(innermost_hit.clone());
+        let target = self.pointer_capture.borrow().clone().or(innermost_hit.clone());
 
         if let Some(target) = target {
             self.dispatch_event(&*target, event, true).await;
+        }
+
+        // release pointer capture automatically on pointer up
+        if is_pointer_up {
+            self.pointer_capture.replace(None);
         }
 
         let p = PointerEvent {
@@ -638,6 +654,12 @@ impl WeakWindow {
         }
     }
 
+    pub fn set_pointer_capture(&self, element: &Element) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.set_pointer_capture(element);
+        }
+    }
+
     /// Returns a reference to the currently focused element.
     pub fn is_focused(&self, element: &Element) -> bool {
         self.shared.upgrade().map(|shared| shared.is_focused(element)).unwrap_or(false)
@@ -724,7 +746,7 @@ impl Window {
             cursor_pos: Cell::new(Default::default()),
             last_physical_size: Cell::new(phy_size),
             input_state: Default::default(),
-            pointer_grab: RefCell::new(None),
+            pointer_capture: RefCell::new(None),
             focus: RefCell::new(None),
             background: Cell::new(options.background),
             active_popup: RefCell::new(None),
@@ -733,9 +755,10 @@ impl Window {
 
         application::register_window(window_id, shared.clone());
 
-        // TODO I don't really like the fact that elements themselves call back into the window
+        // Note: I don't really like the fact that elements themselves call back into the window
         // to request a redraw. It would be better if the window could just listen for changes
-        // to the dirty flags.
+        // to the dirty flags. But since only one window is supposed to watch dirty flags,
+        // that would probably be an unnecessary complication.
         let weak = Rc::downgrade(&shared);
         root.set_parent_window(WeakWindow { shared: weak });
 

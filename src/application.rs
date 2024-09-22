@@ -197,7 +197,7 @@ pub fn run(root_future: impl Future<Output = ()> + 'static) -> Result<(), anyhow
                             window_id,
                             event: window_event,
                         } => {
-                            eprintln!("[{:?}] [{:?}]", window_id, window_event);
+                           // eprintln!("[{:?}] [{:?}]", window_id, window_event);
                             // Don't hold a borrow of `state.windows` across the handler since
                             // the handler may create new windows.
                             let handler = state.windows.borrow().get(&window_id).cloned();

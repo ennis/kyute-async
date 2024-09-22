@@ -58,7 +58,7 @@ impl Visual for Text {
         }
     }
 
-    fn layout(&self, _children: &[AnyVisual], constraints: &BoxConstraints) -> Geometry {
+    fn layout(&self, _children: &[Rc<dyn Visual>], constraints: &BoxConstraints) -> Geometry {
         // layout paragraph in available space
         let _span = span!("text layout");
 

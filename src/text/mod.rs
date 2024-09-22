@@ -507,6 +507,7 @@ impl Selection {
     pub fn byte_range(&self) -> Range<usize> {
         self.min()..self.max()
     }
+
 }
 
 impl Default for Selection {

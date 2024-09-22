@@ -233,7 +233,7 @@ impl FrameSizes {
     }
 }
 
-fn compute_intrinsic_sizes(direction: Axis, children: &[AnyVisual]) -> IntrinsicSizes {
+fn compute_intrinsic_sizes(direction: Axis, children: &[Rc<dyn Visual>]) -> IntrinsicSizes {
     let mut isizes = IntrinsicSizes::default();
     for c in children.iter() {
         let s = c.intrinsic_sizes();
@@ -267,7 +267,7 @@ impl Visual for Frame {
         &self.element
     }
 
-    fn layout(&self, children: &[AnyVisual], constraints: &BoxConstraints) -> Geometry {
+    fn layout(&self, children: &[Rc<dyn Visual>], constraints: &BoxConstraints) -> Geometry {
         self.calculate_style();
         let s = self.resolved_style.borrow();
 
